@@ -1,14 +1,20 @@
 ## Hard rule: everything stays inside `emulator/`
 
 Emulator work must NEVER create or modify files outside `emulator/` — not the
-firmware tree (`applications/`, `modules/`, `drivers/`, `prj.conf`, ...), not
-the repo root, not the user's home. Emulator code and config are injected at
-build time instead: out-of-tree Zephyr module (`emulator/module/`, via
-`-DZEPHYR_EXTRA_MODULES`), config/overlay fragments (`emulator/boards/`, via
-`-DCONF_FILE` / `-DEXTRA_DTC_OVERLAY_FILE`), wrapped by `emulator/build.sh`.
-If a ticket's text asks for an edit outside `emulator/`, the ticket is wrong:
-rework it to this pattern (re-declare Kconfig symbols in the module, provide
-stub headers/implementations there, etc.) and update the ticket file.
+firmware workspace (`~/halo-firmware`), not the user's home. The firmware tree
+is consulted **read-only as a development reference** (headers, build
+artifacts, devicetree); the emulator's only runtime input is the firmware
+binary passed to `halo-emu -f`. All emulator code lives here: the QEMU fork
+patches (machine `halo`, peripheral models), the synthetic ROM stub, the
+launcher and tools. If a ticket's text asks for an edit outside `emulator/`,
+the ticket is wrong: rework it (model the hardware, vendor declarations,
+fake at the machine level) and update the ticket file.
+
+Architecture (since the QEMU pivot, 2026-08-24): the emulator is a QEMU
+machine model of the Alif Balletto B1 executing real firmware binaries.
+See `README.md` (decision + roadmap) and `EMULATOR.md` (hardware reference).
+The prior native_sim source-level emulator is archived at git tag
+`archive/native-sim`.
 
 ## Ticket implementation
 

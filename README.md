@@ -1,98 +1,63 @@
-# Halo emulator
+# Halo desktop emulator — QEMU machine emulation
 
-Desktop emulator for the Halo firmware: the **real firmware C code** (Lua runtime,
-canvas renderer, managers, DSP) compiled for Linux on Zephyr's `native_sim` board.
-SDL window as display, host audio for speaker/mic, fake IMU/camera/battery/button.
-Device connection: TCP socket speaking the existing REPL wire protocol (phase 1),
-then real BLE via the host's Bluetooth adapter so a phone connects as if to real
-glasses (phase 2).
+Goal: **run the real device firmware binary**, unmodified —
 
-Full design rationale lives in the plan that produced these tickets; the tickets are
-self-contained. This folder will be moved later — keep paths inside tickets relative
-to the repo root.
+```sh
+halo-emu -f zephyr.bin        # a firmware you built in ~/halo-firmware or downloaded
+```
 
-**Hard rule (see AGENTS.md): the emulator never touches anything outside
-`emulator/`.** The firmware builds unmodified; emulator Kconfig/C/config is
-injected at build time via an out-of-tree Zephyr module (`emulator/module/`)
-plus per-build fragments (`emulator/boards/`), wrapped by `emulator/build.sh`
-(ticket 0002). Build/run doc: `emulator/EMULATOR.md`.
+— with the 256×256 UI in a window, `/lfs` persisted to a host file, and the Lua REPL on
+`tcp://127.0.0.1:9563`.
 
-## Why this is feasible
+## Architecture decision (2026-08-24)
 
-- Lua bindings sit on mostly-clean seams (`halo/audio_stream.h`, the `halo_*` manager
-  headers); `modules/canvas/canvas.c` is pure software.
-- The AEC already builds on host (`applications/halo/tests/aec/host/`).
-- The ~30 Python BLE tests in `applications/halo/tests/` are a ready-made conformance
-  suite.
-- The one thing that can never run off-silicon: Alif's proprietary ROM BLE stack
-  (`CONFIG_BT_CUSTOM`, ~8700 lines in `modules/halo/src/ble_*.c`). It is replaced
-  behind the existing `halo/ble_*.h` header APIs, which every consumer already uses
-  exclusively.
+The first emulator generation (tickets 0001–0008) compiled the firmware **sources** for
+Zephyr `native_sim` — same code, but a host build, so it could never execute a firmware
+*artifact*. The user's requirement is artifact-level testing, so that generation is
+retired; everything about it is recoverable from the git tag **`archive/native-sim`**.
 
-## Workspace & health gate (ticket 0001 findings)
+This generation is a **QEMU machine model** of the Halo's SoC — the Alif **Balletto B1**
+(Cortex-M55 RTSS-HE) — built as a patched QEMU fork (machine `halo`). The firmware binary
+executes instruction-for-instruction; the hardware around it is modeled. Full hardware
+reference (memory map, peripherals, boot-fatal dependencies): `EMULATOR.md`.
 
-`./init.sh` reproduces the whole workspace from scratch (host packages, venv,
-`alif` clone, `west update`, Zephyr SDK) and is safe to re-run;
-`./init.sh --check` re-runs the health gate below. See `./init.sh --help`.
+Key strategy points:
 
-- West workspace: `emulator/src/halo-ws/` (confirmed by the user; confined —
-  nothing written outside it). The firmware is materialized there as `alif`,
-  a standalone clone of `HALO_FW_URL` pinned at `HALO_FW_REV` (defaults in
-  `init.sh`) — the self-contained default, so the emulator keeps working
-  with no other checkout on the machine, wherever `emulator/` lives or moves.
-  For local firmware development, `build.sh --fw-ws <path>` builds from an
-  explicit external west workspace instead (see `EMULATOR.md`).
-  Python venv at `emulator/src/halo-ws/.venv`.
-- Fork board path: `zephyr/boards/posix/native_sim/` (Zephyr 3.6-era hwmv1
-  layout, as expected).
-- **Primary target: `native_sim_64`** (user decision — 32-bit multilib/i386
-  SDL packages not installed; only `libsdl2-dev` amd64). The 32-bit pointer
-  model caveats (Lua lightuserdata, mem_manager address arithmetic) move to
-  testing on 64-bit; revisit if it bites.
-- Toolchain: host gcc 13.3 with `ZEPHYR_TOOLCHAIN_VARIANT=host`; SDL 2.30.
-  `zephyr-sdk-0.16.5/` (minimal + arm-zephyr-eabi) lives in the workspace
-  only for `-b halo` regression configure checks.
-- Health gate: `hello_world` (prints, runs), `subsys/fs/littlefs`
-  (flash_sim + littlefs format/mount/boot-count OK) and `drivers/display`
-  (sdl_dc driver init OK) all build and run on `native_sim_64`.
+- **Secure Enclave**: faked at the MHUv2 mailbox (`0x40040000`/`0x40050000`) with an
+  ack-and-zero responder — sufficient for every boot-path call.
+- **BLE**: the firmware's BLE host stack lives in on-chip ROM and is called through 983
+  pinned addresses. No device/SWD access exists to dump that ROM, so the **permanent**
+  strategy is a **synthetic ROM stub** — our own code linked at those addresses,
+  implementing just the GAPM/GATT surface the app uses, bridging the Lua REPL out to TCP.
+  No proprietary code involved. Consequence: real radio behavior is out of scope; the
+  stub is pinned to ROM symbol map v1_2 and must track firmware ROM-map bumps.
+- **Display**: the CDC200 controller continuously scans out a fixed RGB888 buffer —
+  modeled as a QEMU display device (the UI window).
+- **Independence**: the emulator's only runtime input is the `-f` binary (plus optional
+  MRAM image). `~/halo-firmware` is used read-only as a development *reference*; no
+  build-time coupling to any firmware checkout.
 
-## Tickets
+## Ticket queue
 
-Sequential; a ticket assumes all lower-numbered tickets in its dependency line are in
-`tickets/done/`. Workflow rules: see `AGENTS.md`.
+| # | Ticket | Delivers |
+|---|--------|----------|
+| 0025 | qemu-fork-balletto-machine-skeleton | QEMU fork builds; real zephyr.bin executes to the SE spin |
+| 0026 | se-mhuv2-fake-and-boot-critical-stubs | boot banner + logs, littlefs mounts, parks at BLE init |
+| 0027 | halo-emu-launcher-and-mram-persistence | `halo-emu -f firmware.bin`, persistent `/lfs` |
+| 0028 | synthetic-ble-rom-stub | `main()` completes; Lua runtime starts — **risk item** |
+| 0029 | cdc200-display-window | boot logo + live UI in the QEMU window |
+| 0030 | lua-repl-bridge | REPL on TCP 9563; smoke + device tests rewritten |
+| 0031 | inputs-and-controls | button, battery, LED readout, reboot/wdt hooks |
+| 0032 | audio-optional | speaker/mic (optional) |
+| 0033 | camera-optional | camera from host files (optional) |
+| 0034 | ci-and-firmware-fetch | `--fetch <version>`, CI smoke |
 
-### Phase 1 — core emulator (TCP transport)
-| # | Ticket | Milestone |
-|---|---|---|
-| 0001 | workspace-and-native-sim-gate | M0 gate |
-| 0002 | emulator-build-skeleton | |
-| 0003 | platform-stubs | |
-| 0004 | filesystem-flash-sim | |
-| 0005 | tcp-repl-transport | M1 |
-| 0006 | python-test-shim | M1 green |
-| 0007 | display-hal-extraction | |
-| 0008 | sdl-display-backend | M2 |
-| 0009 | emu-control-plane | |
-| 0010 | button-fake | M3 |
-| 0011 | battery-fake | M3 |
-| 0012 | imu-fake-sensors | M3 |
-| 0013 | led-fake | |
-| 0014 | audio-stream-emu | M4 |
-| 0015 | aec-on-host | M4 |
-| 0016 | camera-video-emu | M5 |
-| 0017 | ci-emulator-build | |
+Sizing honesty: 0025–0027 are each days-to-a-week; **0028 is weeks** (the API surface of
+the ROM stub is reverse-engineered from headers + the link map); 0029–0030 about a week
+each. The UI first appears at 0029, the REPL at 0030. Until 0026 lands, nothing runnable
+exists in this repo.
 
-### Phase 2 — real BLE (phone connects)
-| # | Ticket | Milestone |
-|---|---|---|
-| 0018 | ble-userchan-spike | gate |
-| 0019 | ble-backend-kconfig-choice | |
-| 0020 | zephyr-bt-core-advertising | |
-| 0021 | zephyr-bt-lua-service | |
-| 0022 | zephyr-bt-battery-and-security | |
-| 0023 | mcumgr-ota-transport | |
-| 0024 | phone-verification | phase-2 done |
+## Process
 
-Descoped (never green on emulator): LE Audio over ISO (USB-dongle hardware wall),
-ANCS (optional phase 2.5 — clean-room GATT client), standby/light-sleep, AAD,
-hardware BLE throughput parity.
+Per `AGENTS.md`: everything stays inside `emulator/`; tickets are implemented in order,
+one at a time, and move from `tickets/todo/` to `tickets/done/` when their gate passes.
