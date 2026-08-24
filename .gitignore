@@ -7,3 +7,4 @@ build/
 # persistent MRAM images and cached firmware binaries — runtime artifacts
 *.img
 firmwares/
+deps/

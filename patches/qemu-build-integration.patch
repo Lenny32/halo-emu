@@ -1,0 +1,31 @@
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 82e0bc2..89bf825 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -65,6 +65,14 @@ config EXYNOS4
+     select USB_EHCI_SYSBUS
+     select OR_IRQ
+ 
++config HALO
++    bool
++    default y
++    depends on TCG && ARM
++    select ARM_V7M
++    select SERIAL_MM
++    select UNIMP
++
+ config INTEGRATOR
+     bool
+     default y
+diff --git a/hw/arm/meson.build b/hw/arm/meson.build
+index 4233a80..02f06cf 100644
+--- a/hw/arm/meson.build
++++ b/hw/arm/meson.build
+@@ -3,6 +3,7 @@ arm_common_ss.add(when: 'CONFIG_ARM_VIRT', if_true: files('virt.c'))
+ arm_common_ss.add(when: 'CONFIG_ACPI', if_true: files('virt-acpi-build.c'))
+ arm_common_ss.add(when: 'CONFIG_DIGIC', if_true: files('digic_boards.c'))
+ arm_common_ss.add(when: 'CONFIG_EMCRAFT_SF2', if_true: files('msf2-som.c'))
++arm_common_ss.add(when: 'CONFIG_HALO', if_true: files('halo.c'))
+ arm_common_ss.add(when: 'CONFIG_INTEGRATOR', if_true: files('integratorcp.c'))
+ arm_common_ss.add(when: 'CONFIG_MICROBIT', if_true: files('microbit.c'))
+ arm_common_ss.add(when: 'CONFIG_MPS3R', if_true: files('mps3r.c'))

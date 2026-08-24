@@ -74,3 +74,39 @@ depends only on the `-f` binary at runtime.
   reaches the MHUv2/SE busy-wait (shown via `-d unimp` trace hitting `0x40050000` region, or
   gdbstub backtrace into `se_service.c` addresses from the map).
 - `-d unimp` log reviewed: no *faulting* accesses, only tolerated unimplemented ones.
+
+## Implementation notes (2026-08-24, done)
+
+- **Pin:** QEMU `v11.1.0` (newest stable), shallow-cloned by `init.sh` into `qemu/`;
+  the machine lives in `patches/files/hw/arm/halo.c` + `patches/qemu-build-integration.patch`
+  (hw/arm/Kconfig `config HALO`, hw/arm/meson.build), overlaid and committed by `init.sh`
+  onto fork branch `halo`.
+- **pixman fallback:** apt install is attempted but this host has no passwordless sudo, so
+  `init.sh` builds a pinned static pixman (`pixman-0.44.2`, meson from a pip venv) into
+  `deps/` when the system package is missing. glib/ninja/SDL2 were already present.
+- **TGU:** as the ticket warned, `0xE001Exxx` cannot be mapped in system memory — the
+  armv7m container covers the whole System PPB with a RAZ/WI default region that shadows
+  board memory. The ITGU/DTGU io regions are mapped into `armv7m.container` at
+  systick-style priority 1. CFG reads BLKSZ=7 (4 KiB blocks); LUTs are plain R/W state.
+  Verified via monitor: after boot DTGU LUT7..11 = 0xFFFFFFFF (NS region
+  0x200E0000–0x2017FFFF = blocks 224–383), ITGU CFG reads 0x7.
+- **UART3:** QEMU `serial-mm` @ 0x4901B000 (reg-shift 2, IRQ 127, baudbase 40 MHz/16);
+  the DesignWare DLF write (offset 0xC0, dt `dlf = <0xb>`) falls through to the
+  background `halo.periph` unimplemented region — read-0/write-ignore, driver tolerates.
+- **ROM window:** mapped as RAM 0x00090000..0x00160000 with a global alias at 0x58090000
+  (no ITCM overlap: ITCM ends at 0x80000).
+- **Gate result** with real `zephyr.bin` (0.8.8 @ d1a9645, MSP 0x200D4678 / PC z_arm_reset
+  fetched from 0x80020800 via `init-svtor`):
+  - Boots through `SystemInit` (incl. `sau_tcm_ns_setup()`) and full kernel init with
+    **zero** faulting accesses; `-d unimp,guest_errors` shows only tolerated RAZ/WI
+    (NVIC ACTLR offset 0x8 ×2) and unimplemented-device traces.
+  - Reaches the MHUv2/SE mailbox: 304 accesses in the 0x40040F88–F98 sender frame —
+    `se_service_sync_locked()`'s 100 tries — with the console (already live!) printing
+    101× `<err> se_service: failed to send service 0`, then the documented no-SE end
+    state: `Failed to synchronize with SE (errno=-22)` → fatal assert path.
+  - Execution then continues into later device init and dies in the firmware's own
+    display D-PHY code (division by zero on an unimplemented 0x4903F000 clock read) —
+    beyond this ticket's scope; ticket 0026's SE fake + stubs own that path.
+- Deliberately deferred: MRAM persistence (0027), any MHU response (0026), TGU LUTs are
+  state-only (no actual gating), no machine reset handler for TGU state (reboot re-ORs
+  the same bits, harmless until a ticket needs clean reset).
