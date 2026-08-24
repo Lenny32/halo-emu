@@ -31,8 +31,12 @@
  *    watchdog stub (never fires), DW APB RTC (the tickless-idle
  *    counter), Alif ADC12 with a configurable battery voltage, UTIMER3
  *    as a PWM sink for the LED, eleven DW GPIO banks, and two DW I2C
- *    controllers backed by QEMU I2C buses (no targets yet — absent
- *    addresses NACK cleanly).
+ *    controllers backed by QEMU I2C buses (absent addresses NACK
+ *    cleanly).
+ *  - Display: CDC200 controller @ 0x49031000 as a QEMU graphic console
+ *    (halo_cdc200.c), a DSI-host happy-path fake @ 0x49032000
+ *    (halo_dsi.c), and ack-everything I2C1 register-file targets for
+ *    the vga020 panel (0x54) and TPS65132 PMIC (0x3E).
  *  - Everything else (CGU/AON/VBAT scratch, EVTRTR, ...) is
  *    background-mapped as unimplemented-device so raw boot-time pokes
  *    trace with `-d unimp` instead of faulting.  With BLE absent the
@@ -54,6 +58,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/char/serial-mm.h"
+#include "hw/i2c/i2c.h"
 #include "hw/misc/unimp.h"
 #include "system/address-spaces.h"
 #include "system/system.h"
@@ -114,6 +119,16 @@
 #define HALO_I2C0_IRQ 132
 #define HALO_I2C1_BASE 0x49011000
 #define HALO_I2C1_IRQ 133
+
+/* CDC200 display controller + DSI host fake (halo_cdc200.c, halo_dsi.c) */
+#define HALO_CDC200_BASE 0x49031000
+#define HALO_CDC200_SCANLINE_IRQ 333
+#define HALO_DSI_BASE 0x49032000
+#define HALO_DSI_IRQ 343
+
+/* I2C1 display-path targets (halo_i2c_regfile.c) */
+#define HALO_VGA020_I2C_ADDR 0x54  /* panel: 16-bit register address */
+#define HALO_TPS65132_I2C_ADDR 0x3E /* display PMIC: 8-bit registers */
 
 /* BLE doorbell device (synthetic ROM stub transport, halo_ble.c):
  * doorbell page + fake UTIMER0 channel; IRQ = UTIMER0 capture A, the line
@@ -323,6 +338,43 @@ static void halo_create_peripherals(DeviceState *armv7m)
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, HALO_I2C1_BASE);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, HALO_I2C1_IRQ));
+
+    /*
+     * I2C1 display-path targets: the vga020 panel (16-bit register
+     * addresses) and the TPS65132 rail PMIC (8-bit).  Both are plain
+     * ack-everything register files — the display bring-up only needs
+     * the transfers to succeed.
+     */
+    {
+        I2CBus *i2c1 = I2C_BUS(qdev_get_child_bus(dev, "i2c-bus"));
+        I2CSlave *tgt;
+
+        tgt = i2c_slave_new("halo-i2c-regfile", HALO_VGA020_I2C_ADDR);
+        qdev_prop_set_uint32(DEVICE(tgt), "addr-bytes", 2);
+        i2c_slave_realize_and_unref(tgt, i2c1, &error_fatal);
+
+        tgt = i2c_slave_new("halo-i2c-regfile", HALO_TPS65132_I2C_ADDR);
+        qdev_prop_set_uint32(DEVICE(tgt), "addr-bytes", 1);
+        i2c_slave_realize_and_unref(tgt, i2c1, &error_fatal);
+    }
+
+    /* CDC200 display controller: the UI window (scanline_0 IRQ only —
+     * the driver's ISR is wired to it and resolves everything from
+     * IRQ_STATUS0) */
+    dev = qdev_new("halo-cdc200");
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, HALO_CDC200_BASE);
+    sysbus_connect_irq(sbd, 0,
+                       qdev_get_gpio_in(armv7m, HALO_CDC200_SCANLINE_IRQ));
+
+    /* DSI host fake: PHY-lock/stop-state happy path for the panel
+     * bring-up; its IRQ is wired but never raised */
+    dev = qdev_new("halo-dsi");
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, HALO_DSI_BASE);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, HALO_DSI_IRQ));
 }
 
 /*

@@ -6,8 +6,16 @@ Usage:
     halo-emu -f <firmware.bin|zephyr.signed.bin>
              [--flash <mram.img>] [--flash-erase]
              [--headless] [--gdb]
+             [--screenshot <png> [--screenshot-after <secs>]]
              [--mcuboot <mcuboot.bin>]
              [-- <extra qemu args>]
+
+The 256x256 panel (CDC200) shows up as the QEMU SDL window; --headless
+(-display none) drops the window but the display model still runs, so
+--screenshot works either way: it boots the firmware, waits
+--screenshot-after seconds (default 5), captures the current frame via
+QMP screendump into the given file (.png, or raw PPM for any other
+extension), and shuts the emulator down — the CI path.
 
 The device's 2 MiB MRAM (0x80000000) is backed by a host file
 (default ./mram.img, created blank on first use) mapped MAP_SHARED into
@@ -44,9 +52,15 @@ image in -f.
 """
 
 import argparse
+import json
 import os
+import socket
+import struct
 import subprocess
 import sys
+import tempfile
+import time
+import zlib
 
 MRAM_SIZE = 2 * 1024 * 1024
 
@@ -92,8 +106,18 @@ def parse_args():
                    help="factory reset: zero the non-code regions "
                         "(scratch, storage, SE-reserved)")
     p.add_argument("--headless", action="store_true",
-                   help="no display dependency (currently the default "
-                        "too: the display model lands in ticket 0029)")
+                   help="run without the UI window (-display none); the "
+                        "display model still scans out, so --screenshot "
+                        "keeps working")
+    p.add_argument("--screenshot", metavar="FILE",
+                   help="boot, wait --screenshot-after seconds, capture "
+                        "the current frame to FILE (.png, or raw PPM "
+                        "otherwise) via QMP screendump, then exit")
+    p.add_argument("--screenshot-after", type=float, default=5.0,
+                   metavar="SECS",
+                   help="seconds to run before --screenshot captures "
+                        "(default 5.0 — inside the ~3 s boot-logo hold "
+                        "plus boot time)")
     p.add_argument("--gdb", action="store_true",
                    help="start the gdbstub on :1234 and wait (-s -S)")
     p.add_argument("--ble-port", type=int, default=9564, metavar="PORT",
@@ -164,6 +188,107 @@ def prepare_mram(args):
           file=sys.stderr)
 
 
+class Qmp:
+    """Minimal QMP client over a unix socket."""
+
+    def __init__(self, path, timeout=10.0):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(timeout)
+        self.sock.connect(path)
+        self.buf = b""
+        self._read_msg()  # greeting
+        self.command("qmp_capabilities")
+
+    def _read_msg(self):
+        while b"\n" not in self.buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("QMP socket closed")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        return json.loads(line)
+
+    def command(self, name, **arguments):
+        msg = {"execute": name}
+        if arguments:
+            msg["arguments"] = arguments
+        self.sock.sendall(json.dumps(msg).encode() + b"\n")
+        while True:
+            resp = self._read_msg()
+            if "return" in resp:
+                return resp["return"]
+            if "error" in resp:
+                raise RuntimeError(f"QMP {name}: {resp['error']['desc']}")
+            # asynchronous event — skip
+
+
+def ppm_to_png(ppm_data, out_path):
+    """Convert a binary P6 PPM to an RGB PNG (the QEMU build has no
+    libpng, so screendump always produces PPM)."""
+    fields = []
+    pos = 2  # past "P6"
+    while len(fields) < 3:
+        while pos < len(ppm_data) and ppm_data[pos:pos + 1].isspace():
+            pos += 1
+        if ppm_data[pos:pos + 1] == b"#":
+            pos = ppm_data.index(b"\n", pos) + 1
+            continue
+        start = pos
+        while not ppm_data[pos:pos + 1].isspace():
+            pos += 1
+        fields.append(int(ppm_data[start:pos]))
+    pos += 1  # single whitespace after maxval
+    width, height, maxval = fields
+    if maxval != 255:
+        die(f"unexpected PPM maxval {maxval}")
+    pixels = ppm_data[pos:pos + width * height * 3]
+
+    def chunk(tag, payload):
+        return (struct.pack(">I", len(payload)) + tag + payload +
+                struct.pack(">I", zlib.crc32(tag + payload)))
+
+    stride = width * 3
+    raw = b"".join(b"\x00" + pixels[y * stride:(y + 1) * stride]
+                   for y in range(height))
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    with open(out_path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
+                chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def run_screenshot(cmd, args):
+    """Boot under QMP control, screendump after the delay, shut down."""
+    qmp_dir = tempfile.mkdtemp(prefix="halo-emu-qmp-")
+    qmp_path = os.path.join(qmp_dir, "qmp.sock")
+    dump_path = os.path.join(qmp_dir, "frame.ppm")
+    cmd += ["-qmp", f"unix:{qmp_path},server=on,wait=off"]
+
+    proc = subprocess.Popen(cmd)
+    try:
+        time.sleep(args.screenshot_after)
+        if proc.poll() is not None:
+            die(f"QEMU exited early with code {proc.returncode}")
+        qmp = Qmp(qmp_path)
+        qmp.command("screendump", filename=dump_path)
+        ppm = open(dump_path, "rb").read()
+        if args.screenshot.lower().endswith(".png"):
+            ppm_to_png(ppm, args.screenshot)
+        else:
+            with open(args.screenshot, "wb") as f:
+                f.write(ppm)
+        print(f"halo-emu: screenshot -> {args.screenshot}", file=sys.stderr)
+        qmp.command("quit")
+        proc.wait(timeout=10)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        for f in (dump_path, qmp_path):
+            if os.path.exists(f):
+                os.unlink(f)
+        os.rmdir(qmp_dir)
+
+
 def main():
     args, extra = parse_args()
     if not os.access(QEMU, os.X_OK):
@@ -202,14 +327,17 @@ def main():
               f"tcp://127.0.0.1:{args.ble_port}", file=sys.stderr)
     else:
         cmd += ["-serial", "null"]
-    # Display model arrives with ticket 0029; until then every run is
-    # headless.  The flag is accepted now so invocations stay stable.
-    cmd += ["-display", "none"]
+    # CDC200 display window (ticket 0029): SDL unless --headless.
+    cmd += ["-display", "none" if args.headless else "sdl"]
     if args.gdb:
         cmd += ["-s", "-S"]
         print("halo-emu: gdbstub on tcp::1234, CPU halted "
               "(target remote :1234)", file=sys.stderr)
     cmd += extra
+
+    if args.screenshot:
+        run_screenshot(cmd, args)
+        return
 
     os.execv(QEMU, cmd)
 

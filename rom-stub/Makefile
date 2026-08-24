@@ -44,9 +44,11 @@ LDFLAGS := -nostdlib -nostartfiles -Wl,--gc-sections -Wl,-T,rom-stub.ld \
 all: $(BUILD)/rom-stub-v1_2.bin $(BUILD)/rom-stub-v1_2.syms
 
 # Bare-metal test firmware (gate evidence: no zephyr.bin exists on this
-# host).  Linked against the same pinned ROM addresses via the vendored
-# symbol maps — exactly how the real firmware links against the ROM.
-test-fw: $(BUILD)/fw_blesmoke.bin
+# host).  fw_blesmoke links against the same pinned ROM addresses via the
+# vendored symbol maps — exactly how the real firmware links against the
+# ROM; fw_dispsmoke (ticket 0029) exercises the display path and needs no
+# ROM symbols.
+test-fw: $(BUILD)/fw_blesmoke.bin $(BUILD)/fw_dispsmoke.bin
 
 $(BUILD)/fw_blesmoke.elf: test/fw_blesmoke.c test/fw_start.c test/fw.ld $(LDS) | $(BUILD)
 	$(CC) $(CFLAGS) -nostdlib -nostartfiles \
@@ -60,6 +62,17 @@ $(BUILD)/fw_blesmoke.bin: $(BUILD)/fw_blesmoke.elf
 	$(OBJCOPY) -O binary $< $(BUILD)/fw_blesmoke.tmp.bin
 	{ head -c 2048 /dev/zero; cat $(BUILD)/fw_blesmoke.tmp.bin; } > $@
 	rm -f $(BUILD)/fw_blesmoke.tmp.bin
+
+$(BUILD)/fw_dispsmoke.elf: test/fw_dispsmoke.c test/fw.ld | $(BUILD)
+	$(CC) $(CFLAGS) -nostdlib -nostartfiles \
+		-Wl,-T,test/fw.ld \
+		-Wl,--no-warn-rwx-segments \
+		-o $@ test/fw_dispsmoke.c
+
+$(BUILD)/fw_dispsmoke.bin: $(BUILD)/fw_dispsmoke.elf
+	$(OBJCOPY) -O binary $< $(BUILD)/fw_dispsmoke.tmp.bin
+	{ head -c 2048 /dev/zero; cat $(BUILD)/fw_dispsmoke.tmp.bin; } > $@
+	rm -f $(BUILD)/fw_dispsmoke.tmp.bin
 
 $(BUILD)/%.o: src/%.c src/stub.h src/halo_rom_ipc.h | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
