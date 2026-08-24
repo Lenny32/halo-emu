@@ -79,3 +79,81 @@ removes it). Everything on that path that is boot-fatal gets a model or stub.
 - Execution provably parks in `alif_ble_enable()`'s `k_sem_take(K_FOREVER)`
   (gdbstub thread backtrace) — with no watchdog reset and no SE retry storm.
 - SE responder handles the boot sequence: run-profile, (cold boot) SET_OFF, heartbeats.
+
+## Implementation notes (2026-08-24, done)
+
+All models live in `patches/files/hw/arm/` and are wired in `halo.c`
+(`halo_create_peripherals()`); `patches/qemu-build-integration.patch` adds them
+to the fork's meson/Kconfig (`config HALO` now also selects `DESIGNWARE_I2C`).
+
+- **halo_se.c — MHUv2 pair + SE responder.** One sysbus device, two MMIO
+  regions (receiver 0x40040000/IRQ 37, sender 0x40050000/IRQ 38), channel 0,
+  `MHU_CFG` reads 1. On sender `CH_SET`: the request struct at the global
+  pointer is served in place (structs arrive zeroed, so ack-and-zero is a
+  no-op write), sender `CH_ST` stays 0, `CH_INT_ST` latches if `CH_INT_EN`,
+  and the receiver's `CH_ST` is raised with the echoed pointer — this
+  satisfies both the interrupt path (two IRQs → both driver semaphores) and
+  the pre-kernel `poll_out`/`poll_in` path. Real payloads: GET_RND(400) from
+  `qemu_guest_getrandom` (serves the BLE BD-address path — note this build
+  links **no** entropy driver, so `sys_random_get` isn't a consumer),
+  FW-version(103) banner string, GET_TOC_VERSION(200) = 0x01660000. Everything
+  else (0/311/313/312/208/504/600/800/…) is acked silently; unknown ids trace
+  under `-d unimp`.
+- **halo_wdog.c** — CMSDK watchdog register file that never counts down;
+  `MASKINTSTAT` reads 0 (`halo_watchdog_has_fired()` false). Deliberate: host
+  stalls/gdb must not reboot the guest.
+- **halo_rtc.c** — DW APB RTC, CCVR free-running at 32768 Hz off
+  QEMU_CLOCK_VIRTUAL **regardless of CCR.EN** and strictly monotonic — the
+  driver's CCR shadow is `__noinit` garbage and a CCVR that ever decreases
+  makes `cortex_m_systick.c` call the driver's missing `get_top_value` (NULL).
+  CMR match sets RSTAT + IRQ 58 when IEN&&!MASK; EOI read clears.
+- **halo_adc.c** — conversion on ANY `ADC_CONTROL` bit0 write while
+  `START_SRC` bit7 set (the driver re-arms from inside the ISR with RMW-OR,
+  so no edge detect); result → `SAMPLE_REG[init_channel]`, `ADC_SEL` =
+  channel, DONE1 (bit1, W1C @0x10) → IRQ 154. qdev prop `battery-raw`
+  (default 3698 ≙ 3.9 V through the 1k/2.4k divider ⇒ 66% SoC — confirmed in
+  the boot log). comp (0x49023000) and AON (0x1A604000) windows are plain
+  storage.
+- **halo_utimer.c** — utimer3 block as plain register storage (the PWM driver
+  never reads hardware status; all RMWs read back) + the 0x24-byte global
+  block with RUNNING derived from START/STOP and DRIVER_OEN/CLOCK_ENABLE
+  state. LED duty readout for 0031: `COMPARE_A(0xD0) / CNTR_PTR(0xA4)`, gated
+  by `COMPARE_CTRL_A(0x8C)` bits 8/9.
+- **halo_gpio.c** — DW GPIO port A, 11 instances (gpio0–9 @ 0x4900n000,
+  lpgpio @ 0x42002000), per-pin NVIC lines (179+, 171/172), qdev prop
+  `ngpios`. `EXT_PORTA = (DR&DDR)|(in&~DDR)` (the driver reads it for outputs
+  too), `INTSTATUS = raw & INTEN & ~INTMASK`, EOI W1C. External inputs are
+  qdev "in" lines for ticket 0031; they idle at 0 (button released, vbat
+  charger-state pin low = not charging).
+- **I2C**: QEMU upstream `designware-i2c` (v11.1 has it — reused instead of a
+  custom model). Provides the `IC_COMP_TYPE` magic the Zephyr driver checks at
+  init and NACK→TX_ABRT→clean -EIO for the absent bma580/pag7982 targets;
+  future sensor/panel targets attach as I2CSlaves on its "i2c-bus".
+- **Scratch config RAM blocks** in halo.c: EXPSLV 0x4902F000, EXPMST
+  0x4903F000, M55HE-CFG 0x43007000. EXPMST is the fix for the display D-PHY
+  division-by-zero from the 0025 notes: the driver writes the CDC200 pixclk
+  divisor and reads it back; read-as-zero divided by zero.
+- **ROM window filler** in halo.c: the BLE/LC3 window (0x90000–0x160000) is
+  filled with Thumb `bx lr`. Without it, `ble_task`'s call to the ROM's
+  `ble_stack_init` (0x140D55) executed zeros off the window end → fatal
+  prefetch abort → `arch_system_halt` before the deferred log ever flushed
+  (the silent-console symptom). With it, every ROM entry returns immediately,
+  `ble_task` parks in its event loop, and the init callback never fires —
+  producing exactly the documented block in `alif_ble_enable()`. Ticket 0028
+  replaces the contents with the real synthetic ROM.
+- **MRAM/littlefs**: nothing needed beyond 0025's writable MRAM — first boot
+  logs `can't mount (LFS -84); formatting` then mounts. Persistence is 0027.
+
+### Gate evidence
+
+- Console (`-serial stdio`): Halo banner, `Hardware Version: halo`,
+  `Firmware Version: 0.8.8-debug`, deferred logs for pm → mem → wdt (5000 ms)
+  → led → battery → file; littlefs auto-format + mount; battery EMA seeds at
+  66 at t+15 s (the 3.9 V default).
+- 90 s soak: exactly one banner (no watchdog reset), no SE retries, no error
+  storms; `-d unimp,guest_errors` shows only the known NVIC ACTLR RAZ/WI pair
+  and four ack-and-zero SE services (311, 313, 208, 800).
+- Park proof via gdbstub (`arm-zephyr-eabi-gdb`): CPU in `arch_cpu_idle`;
+  `z_main_thread.base.thread_state == 2` (_THREAD_PENDING) and the main-thread
+  stack holds return address `0x8002daeb` ∈ `alif_ble_enable`
+  (0x8002da7d+0x98) — the `k_sem_take(&rwip_init_sem, K_FOREVER)` call site.

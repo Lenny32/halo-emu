@@ -22,11 +22,20 @@
  *    QEMU's serial-mm covers the 16550 register file; the DesignWare
  *    extras (DLF @ 0xC0 etc.) fall through to the background
  *    unimplemented-device region (read 0 / ignore writes).
- *  - Everything else (CGU/AON/VBAT scratch, MHUv2 SE mailbox, ...) is
+ *  - SE fake: the MHUv2 mailbox pair (sender 0x40050000 / IRQ 38,
+ *    receiver 0x40040000 / IRQ 37) with an ack-and-zero Secure Enclave
+ *    responder behind it (halo_se.c).
+ *  - Boot-critical peripherals (see the halo_*.c models): CMSDK
+ *    watchdog stub (never fires), DW APB RTC (the tickless-idle
+ *    counter), Alif ADC12 with a configurable battery voltage, UTIMER3
+ *    as a PWM sink for the LED, eleven DW GPIO banks, and two DW I2C
+ *    controllers backed by QEMU I2C buses (no targets yet — absent
+ *    addresses NACK cleanly).
+ *  - Everything else (CGU/AON/VBAT scratch, EVTRTR, ...) is
  *    background-mapped as unimplemented-device so raw boot-time pokes
- *    trace with `-d unimp` instead of faulting.  With no SE responder
- *    the firmware busy-waits in se_service_sync_locked() — the expected
- *    end state until the SE fake lands.
+ *    trace with `-d unimp` instead of faulting.  With BLE absent the
+ *    firmware is expected to park in alif_ble_enable() until the
+ *    synthetic ROM ticket.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -76,6 +85,32 @@
 #define HALO_UART3_IRQ 127
 #define HALO_UART3_CLK 40000000 /* refclk 40 MHz -> baudbase = clk/16 */
 
+/* SE mailbox: MHUv2 receiver/sender pair (halo_se.c) */
+#define HALO_MHU_RECV_BASE 0x40040000
+#define HALO_MHU_RECV_IRQ 37
+#define HALO_MHU_SEND_BASE 0x40050000
+#define HALO_MHU_SEND_IRQ 38
+
+#define HALO_WDOG_BASE 0x40100000
+
+#define HALO_RTC_BASE 0x42000000
+#define HALO_RTC_IRQ 58
+
+/* ADC0 windows (alif,adc: adc/analog, comparator, AON) + DONE1 IRQ */
+#define HALO_ADC_BASE 0x49020000
+#define HALO_ADC_COMP_BASE 0x49023000
+#define HALO_ADC_AON_BASE 0x1A604000
+#define HALO_ADC_DONE1_IRQ 154
+
+/* UTIMER3 (LED PWM) + shared utimer global block */
+#define HALO_UTIMER3_BASE 0x48004000
+#define HALO_UTIMER_GLB_BASE 0x48000000
+
+#define HALO_I2C0_BASE 0x49010000
+#define HALO_I2C0_IRQ 132
+#define HALO_I2C1_BASE 0x49011000
+#define HALO_I2C1_IRQ 133
+
 /*
  * TCM gating units (Alif "TGU", in the PPB): base +0x0 CTRL, +0x4 CFG
  * (BLKSZ in [3:0], block size = 2^(BLKSZ+5)), LUTs from +0x10.
@@ -105,6 +140,9 @@ struct HaloMachineState {
     MemoryRegion romwin_alias;
     MemoryRegion dtcm;
     MemoryRegion dtcm_alias;
+    MemoryRegion expslv;
+    MemoryRegion expmst;
+    MemoryRegion m55he_cfg;
     HaloTGU itgu;
     HaloTGU dtgu;
     Clock *sysclk;
@@ -173,6 +211,104 @@ static void halo_make_alias(MemoryRegion *mr, const char *name,
     memory_region_add_subregion(get_system_memory(), base, mr);
 }
 
+/*
+ * DW GPIO banks (halo_gpio.c).  Every pin has its own NVIC line,
+ * consecutive from irq_base; the Zephyr ISR resolves the pin from
+ * INTSTATUS, not the vector, so a straight 1:1 wiring suffices.
+ */
+static const struct {
+    const char *name;
+    hwaddr base;
+    int irq_base;
+    uint32_t ngpios;
+} halo_gpio_banks[] = {
+    { "gpio0", 0x49000000, 179, 8 },
+    { "gpio1", 0x49001000, 187, 8 },
+    { "gpio2", 0x49002000, 195, 8 },
+    { "gpio3", 0x49003000, 203, 8 },
+    { "gpio4", 0x49004000, 211, 8 },
+    { "gpio5", 0x49005000, 219, 8 },
+    { "gpio6", 0x49006000, 227, 8 },
+    { "gpio7", 0x49007000, 235, 8 },
+    { "gpio8", 0x49008000, 243, 8 },
+    { "gpio9", 0x49009000, 251, 3 },
+    { "lpgpio", 0x42002000, 171, 2 },
+};
+
+static void halo_create_peripherals(DeviceState *armv7m)
+{
+    SysBusDevice *sbd;
+    DeviceState *dev;
+
+    /* MHUv2 pair + Secure Enclave responder */
+    dev = qdev_new("halo-se");
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, HALO_MHU_RECV_BASE);
+    sysbus_mmio_map(sbd, 1, HALO_MHU_SEND_BASE);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, HALO_MHU_RECV_IRQ));
+    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(armv7m, HALO_MHU_SEND_IRQ));
+
+    /* watchdog stub: armed and fed by the firmware, never fires */
+    dev = qdev_new("halo-wdog");
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, HALO_WDOG_BASE);
+
+    /* DW APB RTC: the cortex-m idle timer */
+    dev = qdev_new("halo-rtc");
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, HALO_RTC_BASE);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, HALO_RTC_IRQ));
+
+    /* ADC0: VBAT on channel 4 (default battery-raw reads as 3.9 V) */
+    dev = qdev_new("halo-adc");
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, HALO_ADC_BASE);
+    sysbus_mmio_map(sbd, 1, HALO_ADC_COMP_BASE);
+    sysbus_mmio_map(sbd, 2, HALO_ADC_AON_BASE);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, HALO_ADC_DONE1_IRQ));
+
+    /* UTIMER3 PWM sink (LED duty cycle recorder) */
+    dev = qdev_new("halo-utimer");
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, HALO_UTIMER3_BASE);
+    sysbus_mmio_map(sbd, 1, HALO_UTIMER_GLB_BASE);
+
+    for (unsigned i = 0; i < ARRAY_SIZE(halo_gpio_banks); i++) {
+        dev = qdev_new("halo-dwgpio");
+        qdev_prop_set_uint32(dev, "ngpios", halo_gpio_banks[i].ngpios);
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, halo_gpio_banks[i].base);
+        for (unsigned pin = 0; pin < halo_gpio_banks[i].ngpios; pin++) {
+            sysbus_connect_irq(sbd, pin,
+                qdev_get_gpio_in(armv7m, halo_gpio_banks[i].irq_base + pin));
+        }
+    }
+
+    /*
+     * DW I2C controllers — QEMU's upstream designware-i2c model.
+     * Targets (IMU, camera, panel — later tickets) attach to the
+     * "i2c-bus" child bus; absent addresses NACK the start, which the
+     * Zephyr driver turns into a clean -EIO via TX_ABRT.
+     */
+    dev = qdev_new("designware-i2c");
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, HALO_I2C0_BASE);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, HALO_I2C0_IRQ));
+
+    dev = qdev_new("designware-i2c");
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, HALO_I2C1_BASE);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, HALO_I2C1_IRQ));
+}
+
 static void halo_init(MachineState *machine)
 {
     HaloMachineState *hms = HALO_MACHINE(machine);
@@ -193,6 +329,23 @@ static void halo_init(MachineState *machine)
                   HALO_ROMWIN_SIZE);
     halo_make_alias(&hms->romwin_alias, "halo.romwin.alias", &hms->romwin,
                     HALO_ROMWIN_ALIAS);
+    /*
+     * Fill the (empty) BLE/LC3 ROM window with Thumb `bx lr` so every
+     * ROM entry point (ble_stack_init @ 0x140D55, rwip_* @ 0xBC0xx, ...)
+     * returns immediately instead of executing zeros off the end of the
+     * window (a fatal prefetch abort that kills the whole boot).  With
+     * this, ble_task() parks in its event loop, the ROM init callback
+     * never fires, and main() blocks in alif_ble_enable()'s
+     * k_sem_take(K_FOREVER) — the documented pre-BLE end state.  The
+     * synthetic-ROM ticket replaces these contents with a real stub.
+     */
+    {
+        uint16_t *rom = memory_region_get_ram_ptr(&hms->romwin);
+
+        for (hwaddr i = 0; i < HALO_ROMWIN_SIZE / 2; i++) {
+            rom[i] = cpu_to_le16(0x4770); /* bx lr */
+        }
+    }
     halo_make_ram(&hms->dtcm, "halo.dtcm", HALO_DTCM_BASE, HALO_DTCM_SIZE);
     halo_make_alias(&hms->dtcm_alias, "halo.dtcm.alias", &hms->dtcm,
                     HALO_DTCM_ALIAS);
@@ -206,6 +359,17 @@ static void halo_init(MachineState *machine)
      */
     create_unimplemented_device("halo.cgu-aon", 0x1A000000, 0x01000000);
     create_unimplemented_device("halo.periph", 0x40000000, 0x10000000);
+
+    /*
+     * Boot-time clock/config scratch blocks whose read-modify-write
+     * values must stick: EXPSLV (UART/I2C/ADC clock ctrl), EXPMST
+     * (CDC200 pixclk ctrl — a read-as-zero divisor here is the display
+     * driver's division by zero), M55HE config (per-core clock enables,
+     * camera pixclk).  Plain RAM gives them register-file semantics.
+     */
+    halo_make_ram(&hms->expslv, "halo.expslv", 0x4902F000, 0x1000);
+    halo_make_ram(&hms->expmst, "halo.expmst", 0x4903F000, 0x1000);
+    halo_make_ram(&hms->m55he_cfg, "halo.m55he-cfg", 0x43007000, 0x1000);
 
     object_initialize_child(OBJECT(machine), "armv7m", &hms->armv7m,
                             TYPE_ARMV7M);
@@ -246,6 +410,9 @@ static void halo_init(MachineState *machine)
     serial_mm_init(sysmem, HALO_UART3_BASE, 2,
                    qdev_get_gpio_in(armv7m, HALO_UART3_IRQ),
                    HALO_UART3_CLK / 16, serial_hd(0), DEVICE_LITTLE_ENDIAN);
+
+    /* SE fake + boot-critical peripheral models */
+    halo_create_peripherals(armv7m);
 
     /* Raw app image (zephyr.bin / zephyr.signed.bin) into MRAM slot 0 */
     armv7m_load_kernel(hms->armv7m.cpu, machine->kernel_filename,

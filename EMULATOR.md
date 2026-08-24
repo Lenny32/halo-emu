@@ -1,8 +1,11 @@
 # Halo emulator — target UX and hardware reference
 
 **Status: rebuilding.** The QEMU-based emulator is being implemented ticket by ticket
-(see `README.md`); nothing is runnable until ticket 0026 lands. The retired native_sim
-emulator lives at git tag `archive/native-sim`.
+(see `README.md`). As of ticket 0026 the real firmware boots to its pre-BLE limit:
+banner + logs on the console, littlefs mounted, main() parked in `alif_ble_enable()`
+(run `qemu/build/qemu-system-arm -M halo -kernel zephyr.bin -serial stdio -display none`;
+the `halo-emu` launcher is ticket 0027). The retired native_sim emulator lives at git
+tag `archive/native-sim`.
 
 ## Target UX
 
