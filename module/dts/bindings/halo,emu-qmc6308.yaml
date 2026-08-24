@@ -1,0 +1,10 @@
+# Copyright (c) 2025 Brilliant Labs
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Emulated QMC6308 magnetometer (module/src/fake_sensors.c), wired as chosen
+  zephyr,magn for lua_imu.c. Zero vector until ticket 0012.
+
+compatible: "halo,emu-qmc6308"
+
+include: sensor-device.yaml

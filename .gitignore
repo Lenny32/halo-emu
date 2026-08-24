@@ -1,0 +1,12 @@
+# emulator West workspace (ticket 0001) — multi-GB, never commit
+src/halo-ws/
+
+# build output (build.sh -d target; binary at build/halo-emu)
+build/
+
+# remembered --fw-ws firmware workspace path (machine-local)
+.fw-ws
+
+# persistent /lfs flash image, created by running the emulator from this
+# directory (ticket 0004 file-backed default) — runtime artifact
+flash.bin

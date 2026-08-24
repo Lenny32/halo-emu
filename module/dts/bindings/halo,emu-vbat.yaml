@@ -1,0 +1,12 @@
+# Copyright (c) 2025 Brilliant Labs
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Emulated Halo battery gauge (module/src/fake_sensors.c). Node must carry
+  the label `vbat` — battery_manager.c and lua_system.c look it up by
+  DT_NODELABEL. Fixed 4000 mV / 80% / not-charging until ticket 0011 makes
+  the values control-plane-settable.
+
+compatible: "halo,emu-vbat"
+
+include: sensor-device.yaml

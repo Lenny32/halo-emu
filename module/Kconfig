@@ -1,0 +1,127 @@
+# Copyright (c) 2025 Brilliant Labs
+# SPDX-License-Identifier: Apache-2.0
+#
+# Emulator-only Kconfig symbols. This file is merged only when the emulator
+# module is passed via ZEPHYR_EXTRA_MODULES — the firmware tree (and its
+# hardware builds) is never touched by the emulator.
+
+config HALO_EMULATOR
+	bool "Halo desktop emulator support"
+	depends on ARCH_POSIX
+	default y
+	# HALO_PM_MANAGER (always selected by HALO) selects PM, and PM requires
+	# the arch-provided HAS_PM, which the POSIX arch does not set — that
+	# y-select with unmet dependencies is a fatal Kconfig warning. Assert
+	# HAS_PM here; the missing pm_state_set()/... hooks are link errors
+	# that the platform-stub ticket (0003) implements in this module.
+	select HAS_PM
+	help
+	  Build the Halo application as a desktop emulator on Zephyr's POSIX
+	  architecture (native_sim). Hardware-only components are replaced by
+	  host-side fakes (SDL display, host audio, fake sensors) provided by
+	  this module; the REPL wire protocol is served over TCP instead of
+	  the Alif ROM BLE stack.
+
+if HALO_EMULATOR
+
+config HALO_TRANSPORT_TCP
+	bool "TCP REPL transport"
+	depends on !HALO_BLE_MANAGER
+	default y
+	# the RX rings reuse ble_lua.c's machinery; on hardware the BLE
+	# manager's Kconfig pulls this in
+	select RING_BUFFER
+	help
+	  Serve the BLE Lua service wire protocol (REPL, data, audio and video
+	  channels) on a host TCP socket, so the existing Python test suite and
+	  clients connect to the emulator unchanged.
+
+# Re-declaration of the firmware symbol (Kconfig ORs the dependencies of a
+# symbol's definition locations): makes HALO_BLE_LUA_SERVICE available
+# without the Alif BLE manager. It is the Lua runtime's transport
+# dependency, and modules/halo only compiles the BLE implementation
+# (ble_lua.c) under HALO_BLE_MANAGER — this module provides the
+# halo/ble_lua.h API over TCP instead (ticket 0005).
+config HALO_BLE_LUA_SERVICE
+	bool "BLE Lua service API (provided by the TCP transport)"
+	depends on HALO_TRANSPORT_TCP
+
+# Same re-declaration trick for the service's buffer-size ints: in the
+# firmware tree they sit inside the `if HALO_BLE_MANAGER` block, so with the
+# BLE manager off they would be invisible and prj.conf's values would not
+# take (lua_runtime.c/lua_bluetooth.c use the macros directly).
+if HALO_BLE_LUA_SERVICE
+
+config HALO_LUA_MAX_REPL_SIZE
+	int "Maximum REPL buffer size (bytes)"
+	default 1024
+
+config HALO_LUA_MAX_DATA_SIZE
+	int "Maximum data buffer size (bytes)"
+	default 4096
+
+config HALO_AUDIO_MAX_DATA_SIZE
+	int "Maximum audio buffer size (bytes)"
+	default 32768
+
+endif # HALO_BLE_LUA_SERVICE
+
+config HALO_EMU_TCP_PORT
+	int "Emulator REPL TCP port"
+	depends on HALO_TRANSPORT_TCP
+	default 9563
+	help
+	  Host TCP port serving the REPL/data wire protocol.
+
+config HALO_EMU_DISPLAY
+	bool "Canvas display via the fake CDC200 scanout buffer"
+	depends on DISPLAY && CANVAS
+	default y
+	help
+	  Compile lua_display.c's full canvas path (fonts, draw functions,
+	  boot logo support) on the emulator. The CONFIG_CDC200 macro is
+	  injected at the compiler level by the module CMakeLists (the Kconfig
+	  CDC200 symbol stays n so the real Alif driver is never built) and
+	  display_fake.c stands in for the cdc200_*/vga020 entry points with
+	  a host RGB888 framebuffer. Presentation of that buffer in an SDL
+	  window is ticket 0008; until then drawing is verifiable through the
+	  control-plane screenshot seam (halo/emu_display.h).
+
+# Re-declaration of the firmware symbol (same OR-the-dependencies trick as
+# HALO_BLE_LUA_SERVICE above): in modules/halo it `depends on CDC200`, which
+# stays n on the emulator — the display fake replaces the CDC200 driver, so
+# the splash path works without it. The original definition's `select LZ4`
+# only fires when its own dependencies hold, hence it is repeated here.
+config HALO_BOOT_LOGO
+	bool "Show boot logo splash (emulator display fake)"
+	depends on HALO_EMU_DISPLAY
+	select LZ4
+
+config HALO_EMU_DISPLAY_FPS
+	int "SDL presenter refresh rate (Hz)"
+	depends on HALO_EMU_DISPLAY && SDL_DISPLAY
+	range 1 120
+	default 30
+	help
+	  Refresh rate of the presenter thread (ticket 0008) that blits the
+	  fake CDC200 scanout buffer to the SDL window while scanout is
+	  enabled — the emulator's stand-in for continuous hardware scanout.
+	  Idle frames are change-detected and skipped, so this is an upper
+	  bound, not a constant cost.
+
+config HALO_EMU_CTRL_PORT
+	int "Emulator control-plane TCP port"
+	default 9564
+	help
+	  Host TCP port for the emulator control plane (fake sensor injection,
+	  button presses, battery levels, screenshots, ...).
+
+config HALO_EMU_MTU
+	int "Emulated transport MTU (bytes)"
+	depends on HALO_TRANSPORT_TCP
+	default 512
+	help
+	  Chunk size the TCP transport reports to the application, standing in
+	  for the negotiated BLE MTU.
+
+endif # HALO_EMULATOR
