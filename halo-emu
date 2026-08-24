@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""halo-emu — run a real Halo firmware image on the QEMU `halo` machine
+(Alif Balletto B1, Cortex-M55 RTSS-HE) with persistent MRAM.
+
+Usage:
+    halo-emu -f <firmware.bin|zephyr.signed.bin>
+             [--flash <mram.img>] [--flash-erase]
+             [--headless] [--gdb]
+             [--mcuboot <mcuboot.bin>]
+             [-- <extra qemu args>]
+
+The device's 2 MiB MRAM (0x80000000) is backed by a host file
+(default ./mram.img, created blank on first use) mapped MAP_SHARED into
+the machine, so /lfs — installed main.lua, settings, logs — survives
+restarts exactly like the hardware's non-volatile MRAM.
+
+On every launch the -f image is written into the MRAM slot0 window of
+the backing file (padding the window's remainder with zeros so a
+previously flashed, longer image leaves no stale tail); every other
+region is left untouched — mirroring a device that got new firmware
+flashed but kept its filesystem.  Both the unsigned zephyr.bin and
+zephyr.signed.bin work: the imgtool header occupies the linked 0x800
+CONFIG_ROM_START_OFFSET pad, so the load address (0x80020000) and the
+vector table (0x80020800) are identical.
+
+MRAM partition map (single source of truth for this repo):
+
+    name         MRAM offset   size       content
+    mcuboot      0x000000      0x020000   bootloader (only in --mcuboot mode)
+    image-0      0x020000      0x0C3000   application slot0  <- -f goes here
+    image-1      0x0E3000      0x0C3000   application slot1 (OTA)
+    scratch      0x1A6000      0x002000   mcuboot swap scratch
+    storage      0x1A8000      0x020000   littlefs /lfs
+    SE-reserved  0x1C8000      0x038000   Secure Enclave region
+
+--flash-erase zeroes the non-code regions (scratch, storage,
+SE-reserved) — the factory-reset path; the firmware re-formats /lfs on
+the next boot.
+
+--mcuboot <mcuboot.bin> (chain-boot spike): writes the bootloader at
+MRAM offset 0 and vectors the CPU from 0x80000000 instead of the app
+slot, letting mcuboot verify slot0 and jump to it.  Requires a signed
+image in -f.
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+
+MRAM_SIZE = 2 * 1024 * 1024
+
+# Partition map (see module docstring)
+MCUBOOT_OFF, MCUBOOT_SIZE = 0x000000, 0x020000
+SLOT0_OFF, SLOT_SIZE = 0x020000, 0x0C3000
+SLOT1_OFF = 0x0E3000
+SCRATCH_OFF, SCRATCH_SIZE = 0x1A6000, 0x002000
+STORAGE_OFF, STORAGE_SIZE = 0x1A8000, 0x020000
+SE_OFF, SE_SIZE = 0x1C8000, 0x038000
+
+APP_VTOR = 0x80020800
+MCUBOOT_VTOR = 0x80000000
+
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+QEMU = os.path.join(REPO_ROOT, "qemu", "build", "qemu-system-arm")
+
+
+def die(msg):
+    print(f"halo-emu: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def parse_args():
+    argv = sys.argv[1:]
+    extra = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
+
+    p = argparse.ArgumentParser(
+        prog="halo-emu",
+        description="Run a Halo firmware image on the QEMU halo machine "
+                    "with persistent MRAM.")
+    p.add_argument("-f", "--firmware", required=True, metavar="BIN",
+                   help="firmware image (zephyr.bin or zephyr.signed.bin)")
+    p.add_argument("--flash", default="./mram.img", metavar="IMG",
+                   help="MRAM backing file (default ./mram.img, "
+                        "created blank)")
+    p.add_argument("--flash-erase", action="store_true",
+                   help="factory reset: zero the non-code regions "
+                        "(scratch, storage, SE-reserved)")
+    p.add_argument("--headless", action="store_true",
+                   help="no display dependency (currently the default "
+                        "too: the display model lands in ticket 0029)")
+    p.add_argument("--gdb", action="store_true",
+                   help="start the gdbstub on :1234 and wait (-s -S)")
+    p.add_argument("--mcuboot", metavar="BIN",
+                   help="chain-boot spike: load this mcuboot at MRAM 0 "
+                        "and vector from 0x80000000")
+    args = p.parse_args(argv)
+    return args, extra
+
+
+def prepare_mram(args):
+    """Create/refresh the MRAM backing file: firmware into slot0, other
+    regions preserved (or zeroed with --flash-erase)."""
+    try:
+        firmware = open(args.firmware, "rb").read()
+    except OSError as e:
+        die(f"cannot read firmware: {e}")
+    if len(firmware) > SLOT_SIZE:
+        die(f"firmware is {len(firmware):#x} bytes, exceeds slot0 size "
+            f"{SLOT_SIZE:#x}")
+    if len(firmware) < 0x1000:
+        die(f"firmware is only {len(firmware)} bytes — not a Halo image")
+
+    mcuboot = None
+    if args.mcuboot:
+        try:
+            mcuboot = open(args.mcuboot, "rb").read()
+        except OSError as e:
+            die(f"cannot read mcuboot: {e}")
+        if len(mcuboot) > MCUBOOT_SIZE:
+            die(f"mcuboot is {len(mcuboot):#x} bytes, exceeds its "
+                f"{MCUBOOT_SIZE:#x} partition")
+
+    created = not os.path.exists(args.flash)
+    mode = "w+b" if created else "r+b"
+    with open(args.flash, mode) as img:
+        img.truncate(MRAM_SIZE)
+
+        img.seek(SLOT0_OFF)
+        img.write(firmware)
+        img.write(b"\0" * (SLOT_SIZE - len(firmware)))
+
+        if mcuboot is not None:
+            img.seek(MCUBOOT_OFF)
+            img.write(mcuboot)
+            img.write(b"\0" * (MCUBOOT_SIZE - len(mcuboot)))
+
+        if args.flash_erase:
+            for off, size in ((SCRATCH_OFF, SCRATCH_SIZE),
+                              (STORAGE_OFF, STORAGE_SIZE),
+                              (SE_OFF, SE_SIZE)):
+                img.seek(off)
+                img.write(b"\0" * size)
+
+    action = "created blank" if created else "reusing"
+    print(f"halo-emu: {action} {args.flash}; "
+          f"{os.path.basename(args.firmware)} "
+          f"({len(firmware):#x} bytes) -> slot0"
+          + (", non-code regions erased" if args.flash_erase else "")
+          + (f", mcuboot -> 0x0" if mcuboot is not None else ""),
+          file=sys.stderr)
+
+
+def main():
+    args, extra = parse_args()
+    if not os.access(QEMU, os.X_OK):
+        die(f"QEMU binary not found/executable: {QEMU} "
+            "(build the fork first — see README.md)")
+
+    prepare_mram(args)
+
+    svtor = MCUBOOT_VTOR if args.mcuboot else APP_VTOR
+    machine = f"halo,mram-file={args.flash},svtor={svtor:#x}"
+
+    cmd = [QEMU, "-M", machine, "-serial", "mon:stdio"]
+    # Display model arrives with ticket 0029; until then every run is
+    # headless.  The flag is accepted now so invocations stay stable.
+    cmd += ["-display", "none"]
+    if args.gdb:
+        cmd += ["-s", "-S"]
+        print("halo-emu: gdbstub on tcp::1234, CPU halted "
+              "(target remote :1234)", file=sys.stderr)
+    cmd += extra
+
+    os.execv(QEMU, cmd)
+
+
+if __name__ == "__main__":
+    main()

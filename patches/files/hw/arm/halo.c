@@ -8,8 +8,10 @@
  *
  *  - Cortex-M55 with the M-profile security extension (the app runs
  *    Secure and programs one SAU NS region itself in SystemInit).
- *  - Memory map: MRAM 2 MiB @ 0x80000000 (plain writable RAM for now;
- *    persistence is a later ticket), ITCM 512 KiB @ 0 (alias
+ *  - Memory map: MRAM 2 MiB @ 0x80000000 — plain RAM by default, or
+ *    mmap-backed by a host file (machine option `mram-file=...`,
+ *    MAP_SHARED) so littlefs/settings survive restarts like the real
+ *    non-volatile MRAM; ITCM 512 KiB @ 0 (alias
  *    0x58000000), DTCM 1.5 MiB @ 0x20000000 (alias 0x58800000, the
  *    "global" address the SE mailbox and CDC200 use), and a RAM window
  *    at 0x00090000..0x00160000 reserved for the synthetic BLE/LC3 ROM
@@ -42,7 +44,9 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
+#include "qemu/error-report.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "hw/arm/armv7m.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
@@ -147,6 +151,9 @@ struct HaloMachineState {
     HaloTGU dtgu;
     Clock *sysclk;
     Clock *refclk;
+
+    char *mram_file;
+    uint32_t init_svtor;
 };
 
 #define TYPE_HALO_MACHINE MACHINE_TYPE_NAME("halo")
@@ -321,7 +328,27 @@ static void halo_init(MachineState *machine)
     hms->refclk = clock_new(OBJECT(machine), "REFCLK");
     clock_set_hz(hms->refclk, HALO_REFCLK_FRQ);
 
-    halo_make_ram(&hms->mram, "halo.mram", HALO_MRAM_BASE, HALO_MRAM_SIZE);
+    /*
+     * MRAM: with mram-file=... it is a MAP_SHARED mmap of the host
+     * file, so every guest store lands in the file — littlefs state
+     * persists across runs with no explicit flush (the launcher
+     * pre-sizes the file to exactly 2 MiB and injects the firmware
+     * into the slot0 window before boot).
+     */
+    if (hms->mram_file) {
+#ifdef CONFIG_POSIX
+        memory_region_init_ram_from_file(&hms->mram, NULL, "halo.mram",
+                                         HALO_MRAM_SIZE, 0, RAM_SHARED,
+                                         hms->mram_file, 0, &error_fatal);
+        memory_region_add_subregion(sysmem, HALO_MRAM_BASE, &hms->mram);
+#else
+        error_report("halo: mram-file= requires a POSIX host");
+        exit(1);
+#endif
+    } else {
+        halo_make_ram(&hms->mram, "halo.mram", HALO_MRAM_BASE,
+                      HALO_MRAM_SIZE);
+    }
     halo_make_ram(&hms->itcm, "halo.itcm", HALO_ITCM_BASE, HALO_ITCM_SIZE);
     halo_make_alias(&hms->itcm_alias, "halo.itcm.alias", &hms->itcm,
                     HALO_ITCM_ALIAS);
@@ -377,8 +404,12 @@ static void halo_init(MachineState *machine)
     qdev_prop_set_string(armv7m, "cpu-type", machine->cpu_type);
     qdev_prop_set_uint32(armv7m, "num-irq", HALO_NUM_IRQ);
     qdev_prop_set_uint8(armv7m, "num-prio-bits", 8);
-    /* Reset fetches MSP/PC from the app's vector table in MRAM */
-    qdev_prop_set_uint32(armv7m, "init-svtor", HALO_APP_VTOR);
+    /*
+     * Reset fetches MSP/PC from the vector table in MRAM — the app's
+     * by default, 0x80000000 under the mcuboot chain-boot spike
+     * (machine option svtor=).
+     */
+    qdev_prop_set_uint32(armv7m, "init-svtor", hms->init_svtor);
     qdev_connect_clock_in(armv7m, "cpuclk", hms->sysclk);
     qdev_connect_clock_in(armv7m, "refclk", hms->refclk);
     object_property_set_link(OBJECT(&hms->armv7m), "memory", OBJECT(sysmem),
@@ -414,9 +445,52 @@ static void halo_init(MachineState *machine)
     /* SE fake + boot-critical peripheral models */
     halo_create_peripherals(armv7m);
 
-    /* Raw app image (zephyr.bin / zephyr.signed.bin) into MRAM slot 0 */
+    /*
+     * Raw app image (zephyr.bin / zephyr.signed.bin) into MRAM slot 0.
+     * With mram-file= the image is already in the backing file and
+     * -kernel is omitted; a NULL filename still registers the CPU
+     * reset handler (mandatory for M-profile).
+     */
     armv7m_load_kernel(hms->armv7m.cpu, machine->kernel_filename,
                        HALO_APP_BASE, HALO_APP_MAX_SIZE);
+}
+
+static char *halo_get_mram_file(Object *obj, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    return g_strdup(hms->mram_file);
+}
+
+static void halo_set_mram_file(Object *obj, const char *value, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    g_free(hms->mram_file);
+    hms->mram_file = g_strdup(value);
+}
+
+static void halo_get_svtor(Object *obj, Visitor *v, const char *name,
+                           void *opaque, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    visit_type_uint32(v, name, &hms->init_svtor, errp);
+}
+
+static void halo_set_svtor(Object *obj, Visitor *v, const char *name,
+                           void *opaque, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    visit_type_uint32(v, name, &hms->init_svtor, errp);
+}
+
+static void halo_machine_instance_init(Object *obj)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    hms->init_svtor = HALO_APP_VTOR;
 }
 
 static void halo_machine_class_init(ObjectClass *oc, const void *data)
@@ -436,6 +510,18 @@ static void halo_machine_class_init(ObjectClass *oc, const void *data)
     mc->no_floppy = 1;
     mc->no_cdrom = 1;
     mc->no_parallel = 1;
+
+    object_class_property_add_str(oc, "mram-file",
+                                  halo_get_mram_file, halo_set_mram_file);
+    object_class_property_set_description(oc, "mram-file",
+        "Host file backing the 2 MiB MRAM (MAP_SHARED; persistent). "
+        "Must be exactly 2 MiB. When set, omit -kernel: the firmware "
+        "is expected in the file's slot0 window already");
+    object_class_property_add(oc, "svtor", "uint32",
+                              halo_get_svtor, halo_set_svtor, NULL, NULL);
+    object_class_property_set_description(oc, "svtor",
+        "Reset vector table address (default 0x80020800 = app slot0; "
+        "0x80000000 for mcuboot chain-boot)");
 }
 
 static const TypeInfo halo_machine_types[] = {
@@ -443,6 +529,7 @@ static const TypeInfo halo_machine_types[] = {
         .name = TYPE_HALO_MACHINE,
         .parent = TYPE_MACHINE,
         .instance_size = sizeof(HaloMachineState),
+        .instance_init = halo_machine_instance_init,
         .class_init = halo_machine_class_init,
         .interfaces = arm_machine_interfaces,
     },
