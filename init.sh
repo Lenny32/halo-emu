@@ -65,6 +65,25 @@ pkg-config --exists sdl2 || \
     note "warning: SDL2 dev files missing — building without the GUI display \
 (fine for ticket 0025; needed from ticket 0029)"
 
+# --- ARM cross toolchain (ROM stub, ticket 0028) -----------------------------
+
+# The synthetic BLE ROM stub is bare-metal Thumb-2; use the system
+# arm-none-eabi-gcc when present (apt: gcc-arm-none-eabi), otherwise fetch a
+# pinned xPack build into deps/toolchain (no sudo needed).
+XPACK_GCC_VER=14.2.1-1.1
+XPACK_GCC_URL="https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v${XPACK_GCC_VER}/xpack-arm-none-eabi-gcc-${XPACK_GCC_VER}-linux-x64.tar.gz"
+
+if ! command -v arm-none-eabi-gcc >/dev/null 2>&1 && \
+   [ ! -x deps/toolchain/bin/arm-none-eabi-gcc ]; then
+    note "fetching arm-none-eabi-gcc ${XPACK_GCC_VER} into deps/toolchain"
+    mkdir -p deps
+    curl -fL --retry 3 -o deps/xpack-gcc.tar.gz "$XPACK_GCC_URL"
+    mkdir -p deps/toolchain
+    tar -xzf deps/xpack-gcc.tar.gz -C deps/toolchain --strip-components=1
+    rm -f deps/xpack-gcc.tar.gz
+    deps/toolchain/bin/arm-none-eabi-gcc --version | head -1
+fi
+
 # --- QEMU checkout, pinned --------------------------------------------------
 
 if [ ! -e qemu/.git ]; then
@@ -105,5 +124,9 @@ if [ ! -f qemu/build/build.ninja ]; then
 fi
 ninja -C qemu/build qemu-system-arm
 
-note "done: qemu/build/qemu-system-arm"
+# --- synthetic BLE/LC3 ROM stub (ticket 0028) --------------------------------
+
+make -C rom-stub all test-fw
+
+note "done: qemu/build/qemu-system-arm + rom-stub/build/rom-stub-v1_2.bin"
 qemu/build/qemu-system-arm --version | head -1

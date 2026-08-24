@@ -69,3 +69,58 @@ exact addresses, implementing only the API surface the app actually uses. Withou
 - No trap-thunk hits during a plain boot; any hit is logged with symbol name + caller PC.
 - A GATT write injected via the doorbell device reaches `ble_lua.c`'s write callback
   (smoke evidence for ticket 0030).
+
+## Implementation notes (done 2026-08-24)
+
+Reworked against the environment actually available (the firmware reference
+tree lives at `~/Projects/halo-firmware`, has **no build directory** and no
+`zephyr.map`, and no firmware binary exists anywhere on this host):
+
+1. **Symbol audit without the map**: intersected the 983+10 symbol names from
+   the vendored `rom_symbols_{ble,lc3}.lds` v1_2 maps with the identifiers used
+   by the compiled-into-app sources (`modules/halo/src/*.c`,
+   `modules/hal/alif/ble/plf/*.c`) → **79 referenced entry points**; the
+   remaining 914 became trap thunks. Call-flow semantics were derived by
+   reading `alif_ble.c`, `ble_connection.c`, `ble_security.c`, `ble_service.c`,
+   `ble_manager.c`, `ble_lua.c`, `ble_battery.c`, `ble_ota.c`, `ble_ancs.c`,
+   `ble_audio.c`.
+2. **Deliverables** (all inside this repo):
+   - `rom-stub/` — the stub: generated 4-byte `b.w` veneers at every pinned
+     address (`gen_rom_layout.py`), semantic GAPM/GAPC/GATT/co_buf
+     implementations, declared-unsupported LE-Audio/LC3 tier, per-symbol trap
+     thunks reporting symbol index + caller LR. Vendored Alif v1_2 headers +
+     symbol maps under `rom-stub/vendor/` (declarations only). Output
+     `rom-stub-v1_2.bin` + `rom-stub-v1_2.syms`.
+   - QEMU: `hw/arm/halo_ble.c` doorbell device (shared rings in the ROM
+     window, chardev bridge, trap decoding via the `.syms` table, fake
+     UTIMER0 channel page whose capture-A IRQ 377 is the host→guest signal —
+     exactly the IRQ `plf/sync_timer.c` connects); `halo.c` gained `rom-file=`
+     and `ble-symfile=` machine options.
+   - `halo-emu` loads the stub automatically and serves the doorbell bridge
+     on `tcp://127.0.0.1:9564` (`--ble-port`).
+   - Toolchain: `init.sh` fetches a pinned xPack `arm-none-eabi-gcc` into
+     `deps/toolchain` when the system has none, and builds the stub.
+   - Pairing is emulated deterministically (Just-Works, fabricated peer keys
+     with the peer address as identity) so `halo_ble_is_paired()` becomes
+     true and the Lua RX write gate opens; `ble_stack_init` returns nonzero
+     because the firmware-side `alif_ble.c` treats the result as a boolean
+     (the header's `BLE_INIT_ERR_NONE = 0` contradicts its own consumer).
+3. **Gate — run literally with a synthetic image** (no `zephyr.bin` exists on
+   this host; see repo memory "no-firmware-build-on-host"):
+   `rom-stub/test/fw_blesmoke.c` re-enacts the firmware's exact ROM call
+   sequence (hook table → `ble_stack_init`/`rwip_init` → GAPM configure/name →
+   GATT service add → adv create/data/scan-rsp/start → `rwip_process` event
+   loop), compiled against the same vendored headers and linked against the
+   same pinned addresses via the `.lds` maps. `tests/smoke_ble.py` evidence:
+   - boot markers `stack-init-ok`, `gapm-ok`, `svc-hdl 0010`, `adv-start`,
+     `ready` — **zero trap hits on the boot path**;
+   - deliberate call to unimplemented `gapm_get_token_id` → QEMU logs
+     `ROM stub trap: gapm_get_token_id (symbol #498) called from
+     LR=0x800214df` and the call returns `GAP_ERR_NOT_SUPPORTED`;
+   - doorbell CONNECT → `connected`/`paired`/`encrypted`; GATT write to the
+     CCC then to the RX value reaches the app's `cb_att_val_set` and the
+     echoed notification arrives back over the bridge — the exact transport
+     ticket 0030 needs.
+   **Follow-up:** re-run the gate against a real `zephyr.bin`
+   (`halo_lua_runtime_init` + `boot_write_img_confirmed()` reached) once a
+   firmware build or release artifact is available (ticket 0034's `--fetch`).

@@ -63,6 +63,8 @@ MCUBOOT_VTOR = 0x80000000
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 QEMU = os.path.join(REPO_ROOT, "qemu", "build", "qemu-system-arm")
+DEFAULT_ROM_STUB = os.path.join(REPO_ROOT, "rom-stub", "build",
+                                "rom-stub-v1_2.bin")
 
 
 def die(msg):
@@ -94,6 +96,14 @@ def parse_args():
                         "too: the display model lands in ticket 0029)")
     p.add_argument("--gdb", action="store_true",
                    help="start the gdbstub on :1234 and wait (-s -S)")
+    p.add_argument("--ble-port", type=int, default=9564, metavar="PORT",
+                   help="TCP port of the BLE doorbell bridge (default 9564; "
+                        "0 disables it)")
+    p.add_argument("--rom-stub", metavar="BIN", default=DEFAULT_ROM_STUB,
+                   help="synthetic BLE/LC3 ROM stub image (default: "
+                        "rom-stub/build/rom-stub-v1_2.bin if built; "
+                        "'none' to boot without one — main() then parks "
+                        "in alif_ble_enable())")
     p.add_argument("--mcuboot", metavar="BIN",
                    help="chain-boot spike: load this mcuboot at MRAM 0 "
                         "and vector from 0x80000000")
@@ -165,7 +175,33 @@ def main():
     svtor = MCUBOOT_VTOR if args.mcuboot else APP_VTOR
     machine = f"halo,mram-file={args.flash},svtor={svtor:#x}"
 
+    # Synthetic BLE/LC3 ROM stub (ticket 0028): loaded into the ROM window
+    # so alif_ble_enable() completes and boot reaches the Lua runtime.
+    rom_stub = None if args.rom_stub == "none" else args.rom_stub
+    if rom_stub:
+        if not os.path.exists(rom_stub):
+            if args.rom_stub is not DEFAULT_ROM_STUB:
+                die(f"ROM stub not found: {rom_stub}")
+            print("halo-emu: warning: ROM stub not built "
+                  "(make -C rom-stub) — booting without it; main() will "
+                  "park in alif_ble_enable()", file=sys.stderr)
+            rom_stub = None
+    if rom_stub:
+        machine += f",rom-file={rom_stub}"
+        symfile = os.path.splitext(rom_stub)[0] + ".syms"
+        if os.path.exists(symfile):
+            machine += f",ble-symfile={symfile}"
+
     cmd = [QEMU, "-M", machine, "-serial", "mon:stdio"]
+    # BLE doorbell bridge: -serial index 1 is the halo-ble chardev (framed
+    # GATT transport; ticket 0030 builds the Lua REPL bridge on it).
+    if rom_stub and args.ble_port:
+        cmd += ["-serial",
+                f"tcp:127.0.0.1:{args.ble_port},server=on,wait=off"]
+        print(f"halo-emu: BLE doorbell bridge on "
+              f"tcp://127.0.0.1:{args.ble_port}", file=sys.stderr)
+    else:
+        cmd += ["-serial", "null"]
     # Display model arrives with ticket 0029; until then every run is
     # headless.  The flag is accepted now so invocations stay stable.
     cmd += ["-display", "none"]

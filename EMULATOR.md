@@ -22,6 +22,12 @@ tag `archive/native-sim`.
 The Lua REPL is served on `tcp://127.0.0.1:9563` (same wire protocol as before:
 `[u8 channel][u16 LE length][payload]`, MTU 512) from ticket 0030.
 
+Since ticket 0028 the synthetic BLE ROM stub (`rom-stub/`, loaded automatically by
+`halo-emu`) unblocks `main()` and exposes a raw GATT **doorbell bridge** on
+`tcp://127.0.0.1:9564` (`--ble-port`): framed `{u8 op, u8 flags, u16 len, payload}`
+messages to connect/pair, inject GATT writes and collect notifications
+(contract: `rom-stub/src/halo_rom_ipc.h`). Ticket 0030's REPL rides on it.
+
 ---
 
 # Hardware reference — Alif Balletto B1 as the halo firmware uses it

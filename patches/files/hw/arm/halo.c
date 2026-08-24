@@ -115,6 +115,13 @@
 #define HALO_I2C1_BASE 0x49011000
 #define HALO_I2C1_IRQ 133
 
+/* BLE doorbell device (synthetic ROM stub transport, halo_ble.c):
+ * doorbell page + fake UTIMER0 channel; IRQ = UTIMER0 capture A, the line
+ * the firmware's BLE sync-timer driver connects (sync_timer.c). */
+#define HALO_BLE_DOORBELL_BASE 0x4904E000
+#define HALO_BLE_UTIMER0_BASE 0x48001000
+#define HALO_BLE_IRQ 377
+
 /*
  * TCM gating units (Alif "TGU", in the PPB): base +0x0 CTRL, +0x4 CFG
  * (BLKSZ in [3:0], block size = 2^(BLKSZ+5)), LUTs from +0x10.
@@ -153,6 +160,8 @@ struct HaloMachineState {
     Clock *refclk;
 
     char *mram_file;
+    char *rom_file;
+    char *ble_symfile;
     uint32_t init_svtor;
 };
 
@@ -316,6 +325,28 @@ static void halo_create_peripherals(DeviceState *armv7m)
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, HALO_I2C1_IRQ));
 }
 
+/*
+ * BLE doorbell: transport between the synthetic ROM stub and the host.
+ * Its chardev is -serial index 1 (the launcher exposes it as a TCP
+ * socket); traps in the stub are decoded with ble-symfile.
+ */
+static void halo_create_ble(HaloMachineState *hms, DeviceState *armv7m)
+{
+    DeviceState *dev = qdev_new("halo-ble");
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    if (serial_hd(1)) {
+        qdev_prop_set_chr(dev, "chardev", serial_hd(1));
+    }
+    if (hms->ble_symfile) {
+        qdev_prop_set_string(dev, "symfile", hms->ble_symfile);
+    }
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, HALO_BLE_DOORBELL_BASE);
+    sysbus_mmio_map(sbd, 1, HALO_BLE_UTIMER0_BASE);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, HALO_BLE_IRQ));
+}
+
 static void halo_init(MachineState *machine)
 {
     HaloMachineState *hms = HALO_MACHINE(machine);
@@ -372,6 +403,29 @@ static void halo_init(MachineState *machine)
         for (hwaddr i = 0; i < HALO_ROMWIN_SIZE / 2; i++) {
             rom[i] = cpu_to_le16(0x4770); /* bx lr */
         }
+    }
+
+    /*
+     * Synthetic BLE/LC3 ROM stub (rom-stub/, ticket 0028): overlay the
+     * built image onto the window.  Without it the bx-lr fill keeps the
+     * pre-0028 behavior (main() parks in alif_ble_enable()).
+     */
+    if (hms->rom_file) {
+        gsize len = 0;
+        g_autofree char *blob = NULL;
+        GError *gerr = NULL;
+
+        if (!g_file_get_contents(hms->rom_file, &blob, &len, &gerr)) {
+            error_report("halo: cannot read rom-file: %s", gerr->message);
+            exit(1);
+        }
+        if (len > HALO_ROMWIN_SIZE) {
+            error_report("halo: rom-file is %zu bytes, exceeds the "
+                         "0x%x ROM window", (size_t)len,
+                         (unsigned)HALO_ROMWIN_SIZE);
+            exit(1);
+        }
+        memcpy(memory_region_get_ram_ptr(&hms->romwin), blob, len);
     }
     halo_make_ram(&hms->dtcm, "halo.dtcm", HALO_DTCM_BASE, HALO_DTCM_SIZE);
     halo_make_alias(&hms->dtcm_alias, "halo.dtcm.alias", &hms->dtcm,
@@ -445,6 +499,9 @@ static void halo_init(MachineState *machine)
     /* SE fake + boot-critical peripheral models */
     halo_create_peripherals(armv7m);
 
+    /* BLE doorbell (synthetic ROM stub transport) */
+    halo_create_ble(hms, armv7m);
+
     /*
      * Raw app image (zephyr.bin / zephyr.signed.bin) into MRAM slot 0.
      * With mram-file= the image is already in the backing file and
@@ -468,6 +525,36 @@ static void halo_set_mram_file(Object *obj, const char *value, Error **errp)
 
     g_free(hms->mram_file);
     hms->mram_file = g_strdup(value);
+}
+
+static char *halo_get_rom_file(Object *obj, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    return g_strdup(hms->rom_file);
+}
+
+static void halo_set_rom_file(Object *obj, const char *value, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    g_free(hms->rom_file);
+    hms->rom_file = g_strdup(value);
+}
+
+static char *halo_get_ble_symfile(Object *obj, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    return g_strdup(hms->ble_symfile);
+}
+
+static void halo_set_ble_symfile(Object *obj, const char *value, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    g_free(hms->ble_symfile);
+    hms->ble_symfile = g_strdup(value);
 }
 
 static void halo_get_svtor(Object *obj, Visitor *v, const char *name,
@@ -517,6 +604,17 @@ static void halo_machine_class_init(ObjectClass *oc, const void *data)
         "Host file backing the 2 MiB MRAM (MAP_SHARED; persistent). "
         "Must be exactly 2 MiB. When set, omit -kernel: the firmware "
         "is expected in the file's slot0 window already");
+    object_class_property_add_str(oc, "rom-file",
+                                  halo_get_rom_file, halo_set_rom_file);
+    object_class_property_set_description(oc, "rom-file",
+        "Synthetic BLE/LC3 ROM stub image loaded at 0x00090000 "
+        "(rom-stub/build/rom-stub-v1_2.bin). Without it the ROM window "
+        "reads as bx-lr and boot parks in alif_ble_enable()");
+    object_class_property_add_str(oc, "ble-symfile",
+                                  halo_get_ble_symfile, halo_set_ble_symfile);
+    object_class_property_set_description(oc, "ble-symfile",
+        "ROM symbol table (rom-stub-v1_2.syms) used to decode stub trap "
+        "reports into symbol names");
     object_class_property_add(oc, "svtor", "uint32",
                               halo_get_svtor, halo_set_svtor, NULL, NULL);
     object_class_property_set_description(oc, "svtor",
