@@ -8,3 +8,5 @@ build/
 *.img
 firmwares/
 deps/
+__pycache__/
+*.pyc
