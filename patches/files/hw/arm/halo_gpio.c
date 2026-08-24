@@ -13,8 +13,11 @@
  *  - EXT_PORTA is read even for outputs: (DR & DDR) | (input & ~DDR);
  *  - PORTA_EOI (W1C) clears latched edge interrupts.
  * External input values arrive on qdev GPIO-in lines (named "in", one
- * per pin) — the inputs-and-controls ticket drives them; until then
- * inputs sit at 0 (button released, charger absent).
+ * per pin) — the inputs-and-controls ticket drives them.  The reset
+ * level of each input comes from the "in-default" bitmask property:
+ * active-low lines with an external pull-up (the button on LPGPIO pin
+ * 1) must idle high or the firmware sees them held active and a
+ * level-type interrupt storms.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -65,6 +68,7 @@ struct HaloDwGpioState {
     uint32_t raw_int;      /* latched edges + live levels */
 
     uint32_t ngpios;
+    uint32_t in_default;   /* reset level of the external inputs */
 };
 
 static uint32_t halo_dwgpio_ext(HaloDwGpioState *s)
@@ -72,14 +76,24 @@ static uint32_t halo_dwgpio_ext(HaloDwGpioState *s)
     return (s->dr & s->ddr) | (s->ext_in & ~s->ddr);
 }
 
+/* A pin is edge-sensitive when INTTYPE_LEVEL is set — or when
+ * INT_BOTHEDGE is: for GPIO_INT_EDGE_BOTH the Zephyr driver sets only
+ * the latter and leaves INTTYPE_LEVEL at 0, and the DW IP gives
+ * INT_BOTHEDGE precedence. */
+static uint32_t halo_dwgpio_edge_mode(HaloDwGpioState *s)
+{
+    return s->inttype_level | s->int_bothedge;
+}
+
 /* level-type pins track the (polarity-adjusted) input; edges stay latched */
 static void halo_dwgpio_update(HaloDwGpioState *s)
 {
     uint32_t levels = halo_dwgpio_ext(s);
+    uint32_t edge_mode = halo_dwgpio_edge_mode(s);
     uint32_t level_match = (s->int_polarity & levels) |
                            (~s->int_polarity & ~levels);
-    s->raw_int = (s->raw_int & s->inttype_level & s->inten) |
-                 (~s->inttype_level & s->inten & level_match);
+    s->raw_int = (s->raw_int & edge_mode & s->inten) |
+                 (~edge_mode & s->inten & level_match);
 
     uint32_t status = s->raw_int & s->inten & ~s->intmask;
 
@@ -105,7 +119,7 @@ static void halo_dwgpio_input_set(void *opaque, int pin, int level)
                      ((s->int_polarity & rising) |
                       (~s->int_polarity & falling)));
 
-    s->raw_int |= edge & s->inttype_level & s->inten & bit;
+    s->raw_int |= edge & halo_dwgpio_edge_mode(s) & s->inten & bit;
     halo_dwgpio_update(s);
 }
 
@@ -208,7 +222,7 @@ static void halo_dwgpio_reset(DeviceState *dev)
     s->int_bothedge = 0;
     s->debounce = 0;
     s->ls_sync = 0;
-    s->ext_in = 0;
+    s->ext_in = s->in_default;
     s->raw_int = 0;
     halo_dwgpio_update(s);
 }
@@ -230,6 +244,7 @@ static void halo_dwgpio_init(Object *obj)
 
 static const Property halo_dwgpio_properties[] = {
     DEFINE_PROP_UINT32("ngpios", HaloDwGpioState, ngpios, DWGPIO_MAX_PINS),
+    DEFINE_PROP_UINT32("in-default", HaloDwGpioState, in_default, 0),
 };
 
 static void halo_dwgpio_class_init(ObjectClass *klass, const void *data)

@@ -166,8 +166,10 @@ void hstub_rwip_process(void)
 {
     uint8_t op;
     /* Static: rwip_process is only ever run by the single BLE task, and the
-     * BLE thread stack is too small for a 512-byte local. */
-    static uint8_t payload[512];
+     * BLE thread stack is too small for a buffer this size.  Must hold a
+     * GATT_WRITE frame for a full 512-byte ATT payload plus its 2-byte
+     * handle prefix (ticket 0030: MTU 512). */
+    static uint8_t payload[2 + 512];
 
     for (;;) {
         uint16_t len = stub_ipc_recv(&op, payload, sizeof(payload));

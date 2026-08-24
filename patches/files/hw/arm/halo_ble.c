@@ -80,9 +80,14 @@ struct HaloBLEState {
     /* pending IRQ bits of the fake UTIMER channel */
     uint32_t chan_int;
 
-    /* chardev frame reassembly */
+    /* chardev frame reassembly + H2G flow control: when the ring has no
+     * room for the next complete frame, it stays parked in rxbuf,
+     * chr_can_receive throttles the chardev, and retry_timer polls for
+     * space (the guest advances the tail with no MMIO exit to hook). */
     uint8_t rxbuf[4 + HALO_BLE_MAX_FRAME];
     unsigned rxlen;
+    bool rx_blocked;
+    QEMUTimer retry_timer;
 };
 
 /* ------------------------------------------------------------------ */
@@ -105,16 +110,13 @@ static void ring_st32(hwaddr ring, hwaddr off, uint32_t v)
                         MEMTXATTRS_UNSPECIFIED, &v, 4);
 }
 
-static void h2g_push(HaloBLEState *s, const uint8_t *frame, uint32_t len)
+static bool h2g_push(HaloBLEState *s, const uint8_t *frame, uint32_t len)
 {
     uint32_t head = ring_ld32(HALO_BLE_H2G_RING_ADDR, HALO_BLE_RING_OFF_HEAD);
     uint32_t tail = ring_ld32(HALO_BLE_H2G_RING_ADDR, HALO_BLE_RING_OFF_TAIL);
 
     if (HALO_BLE_RING_DATA - (head - tail) < len) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "halo-ble: H2G ring full, dropping frame (%u bytes)\n",
-                      len);
-        return;
+        return false; /* no room — caller parks the frame and retries */
     }
 
     for (uint32_t i = 0; i < len; i++) {
@@ -129,6 +131,7 @@ static void h2g_push(HaloBLEState *s, const uint8_t *frame, uint32_t len)
 
     s->chan_int |= UT_INT_CAPTURE_A;
     qemu_set_irq(s->irq, 1);
+    return true;
 }
 
 static void g2h_drain(HaloBLEState *s)
@@ -265,24 +268,14 @@ static const MemoryRegionOps utimer_ops = {
 /* Chardev (host side of the bridge)                                   */
 /* ------------------------------------------------------------------ */
 
-static int chr_can_receive(void *opaque)
+#define H2G_RETRY_NS (1 * 1000 * 1000) /* 1 ms ring-space poll */
+
+/* Deliver every complete buffered frame; park and poll when the ring is
+ * full so client bytes are never dropped (backpressure, ticket 0030). */
+static void rx_deliver(HaloBLEState *s)
 {
-    HaloBLEState *s = opaque;
+    bool was_blocked = s->rx_blocked;
 
-    return sizeof(s->rxbuf) - s->rxlen;
-}
-
-static void chr_receive(void *opaque, const uint8_t *buf, int size)
-{
-    HaloBLEState *s = opaque;
-
-    if (size > (int)(sizeof(s->rxbuf) - s->rxlen)) {
-        size = sizeof(s->rxbuf) - s->rxlen;
-    }
-    memcpy(s->rxbuf + s->rxlen, buf, size);
-    s->rxlen += size;
-
-    /* Deliver every complete frame */
     for (;;) {
         uint32_t flen;
 
@@ -299,10 +292,44 @@ static void chr_receive(void *opaque, const uint8_t *buf, int size)
         if (s->rxlen < flen) {
             break;
         }
-        h2g_push(s, s->rxbuf, flen);
+        if (!h2g_push(s, s->rxbuf, flen)) {
+            s->rx_blocked = true;
+            timer_mod(&s->retry_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + H2G_RETRY_NS);
+            return;
+        }
         memmove(s->rxbuf, s->rxbuf + flen, s->rxlen - flen);
         s->rxlen -= flen;
     }
+
+    s->rx_blocked = false;
+    if (was_blocked) {
+        qemu_chr_fe_accept_input(&s->chr);
+    }
+}
+
+static void rx_retry_cb(void *opaque)
+{
+    rx_deliver(opaque);
+}
+
+static int chr_can_receive(void *opaque)
+{
+    HaloBLEState *s = opaque;
+
+    return s->rx_blocked ? 0 : sizeof(s->rxbuf) - s->rxlen;
+}
+
+static void chr_receive(void *opaque, const uint8_t *buf, int size)
+{
+    HaloBLEState *s = opaque;
+
+    if (size > (int)(sizeof(s->rxbuf) - s->rxlen)) {
+        size = sizeof(s->rxbuf) - s->rxlen;
+    }
+    memcpy(s->rxbuf + s->rxlen, buf, size);
+    s->rxlen += size;
+    rx_deliver(s);
 }
 
 /* ------------------------------------------------------------------ */
@@ -315,6 +342,8 @@ static void halo_ble_reset(DeviceState *dev)
 
     s->chan_int = 0;
     s->rxlen = 0;
+    s->rx_blocked = false;
+    timer_del(&s->retry_timer);
     s->trap_lr = 0;
     if (s->trap_seen) {
         bitmap_zero(s->trap_seen, 1024);
@@ -369,6 +398,7 @@ static void halo_ble_realize(DeviceState *dev, Error **errp)
     s->trap_seen = bitmap_new(1024);
     halo_ble_load_symfile(s);
 
+    timer_init_ns(&s->retry_timer, QEMU_CLOCK_VIRTUAL, rx_retry_cb, s);
     qemu_chr_fe_set_handlers(&s->chr, chr_can_receive, chr_receive, NULL,
                              NULL, s, NULL, true);
 }

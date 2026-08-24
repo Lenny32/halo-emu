@@ -53,7 +53,11 @@
 #define STUB_MAX_SERVICES 8
 #define STUB_MAX_ATTS_PER_SVC 24
 #define STUB_FIRST_HDL 0x0010
-#define STUB_MTU 247
+/* Bearer MTU reported to the firmware.  halo_ble_get_mtu() subtracts
+ * GATT_BUFFER_HEADER_LEN (7), so 519 yields the 512-byte usable MTU the
+ * REPL wire protocol promises (frame.bluetooth.max_length() == 511,
+ * ticket 0030). */
+#define STUB_MTU 519
 
 #define STUB_NB_COBUF 10
 #define STUB_COBUF_PAYLOAD 560 /* head + data + tail for one ATT PDU */

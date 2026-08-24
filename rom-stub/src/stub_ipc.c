@@ -62,11 +62,23 @@ bool stub_ipc_send(uint8_t op, const void *hdr, uint16_t hdr_len,
 {
     uint16_t len = hdr_len + payload_len;
     uint8_t fhdr[4] = { op, 0, (uint8_t)(len & 0xFF), (uint8_t)(len >> 8) };
+    unsigned spins = 0;
 
     stub_lock();
-    if (g2h_space() < (uint32_t)(4 + len)) {
+    while (g2h_space() < (uint32_t)(4 + len)) {
+        /* Ring full: kick the doorbell so the host drains it.  The QEMU
+         * device drains synchronously from the MMIO write (and its chardev
+         * write blocks while the TCP client stalls), so this is the
+         * backpressure path — notifications must not drop (ticket 0030).
+         * The drain is a no-op only when no chardev client is attached, in
+         * which case the bytes were discarded and space appears anyway;
+         * the bound is a belt-and-braces guard against a wedged host. */
         stub_unlock();
-        return false; /* host not draining; drop rather than block */
+        stub_ipc_kick();
+        if (++spins > 1000000) {
+            return false;
+        }
+        stub_lock();
     }
     g2h_put(fhdr, 4);
     if (hdr_len) {

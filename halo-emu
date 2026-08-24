@@ -6,9 +6,18 @@ Usage:
     halo-emu -f <firmware.bin|zephyr.signed.bin>
              [--flash <mram.img>] [--flash-erase]
              [--headless] [--gdb]
+             [--repl-port 9563] [--ble-port <raw port>]
              [--screenshot <png> [--screenshot-after <secs>]]
              [--mcuboot <mcuboot.bin>]
              [-- <extra qemu args>]
+
+The Lua REPL bridge (ticket 0030) serves tcp://127.0.0.1:9563 by default:
+[u8 channel][u16 LE length][payload] frames, channel 0 = Lua RX/TX PDUs
+(REPL text / 0x01-marked data / control codes), 1 = audio, 2 = video;
+MTU 512, one client at a time, loopback only.  --ble-port N exposes the
+raw doorbell framing instead (tests/smoke_ble.py).  Both unsigned
+zephyr.bin (vector table at image offset 0) and imgtool-padded images
+(offset 0x800) work — the vector offset is auto-detected.
 
 The 256x256 panel (CDC200) shows up as the QEMU SDL window; --headless
 (-display none) drops the window but the display model still runs, so
@@ -72,8 +81,28 @@ SCRATCH_OFF, SCRATCH_SIZE = 0x1A6000, 0x002000
 STORAGE_OFF, STORAGE_SIZE = 0x1A8000, 0x020000
 SE_OFF, SE_SIZE = 0x1C8000, 0x038000
 
-APP_VTOR = 0x80020800
+MRAM_BASE = 0x80000000
 MCUBOOT_VTOR = 0x80000000
+
+
+def app_vtor_for(firmware):
+    """Locate the vector table inside the firmware image: offset 0x800
+    for imgtool-padded images (zephyr.signed.bin, or an unsigned build
+    with CONFIG_ROM_START_OFFSET=0x800 whose pad the header occupies),
+    offset 0 for a plain `west build` app (CONFIG_ROM_START_OFFSET=0).
+    A valid Cortex-M vector table starts with an SP in SRAM/DTCM and a
+    Thumb reset vector inside MRAM."""
+    def plausible(off):
+        if len(firmware) < off + 8:
+            return False
+        sp, rst = struct.unpack_from("<II", firmware, off)
+        return ((sp & 0xF0000000) == 0x20000000
+                and MRAM_BASE <= rst < MRAM_BASE + MRAM_SIZE
+                and (rst & 1))
+    for off in (0x800, 0):
+        if plausible(off):
+            return MRAM_BASE + SLOT0_OFF + off
+    die("no vector table found at offset 0 or 0x800 — not a Halo image?")
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 QEMU = os.path.join(REPO_ROOT, "qemu", "build", "qemu-system-arm")
@@ -120,9 +149,15 @@ def parse_args():
                         "plus boot time)")
     p.add_argument("--gdb", action="store_true",
                    help="start the gdbstub on :1234 and wait (-s -S)")
-    p.add_argument("--ble-port", type=int, default=9564, metavar="PORT",
-                   help="TCP port of the BLE doorbell bridge (default 9564; "
-                        "0 disables it)")
+    p.add_argument("--repl-port", type=int, default=9563, metavar="PORT",
+                   help="TCP port of the Lua REPL bridge (default 9563; "
+                        "0 disables it). Speaks the native_sim wire "
+                        "protocol: [u8 channel][u16 LE length][payload], "
+                        "MTU 512, loopback only, one client at a time")
+    p.add_argument("--ble-port", type=int, default=0, metavar="PORT",
+                   help="expose the raw BLE doorbell framing on this TCP "
+                        "port instead of running the REPL bridge "
+                        "(0 = off; used by tests/smoke_ble.py)")
     p.add_argument("--rom-stub", metavar="BIN", default=DEFAULT_ROM_STUB,
                    help="synthetic BLE/LC3 ROM stub image (default: "
                         "rom-stub/build/rom-stub-v1_2.bin if built; "
@@ -186,6 +221,7 @@ def prepare_mram(args):
           + (", non-code regions erased" if args.flash_erase else "")
           + (f", mcuboot -> 0x0" if mcuboot is not None else ""),
           file=sys.stderr)
+    return app_vtor_for(firmware)
 
 
 class Qmp:
@@ -295,9 +331,9 @@ def main():
         die(f"QEMU binary not found/executable: {QEMU} "
             "(build the fork first — see README.md)")
 
-    prepare_mram(args)
+    app_vtor = prepare_mram(args)
 
-    svtor = MCUBOOT_VTOR if args.mcuboot else APP_VTOR
+    svtor = MCUBOOT_VTOR if args.mcuboot else app_vtor
     machine = f"halo,mram-file={args.flash},svtor={svtor:#x}"
 
     # Synthetic BLE/LC3 ROM stub (ticket 0028): loaded into the ROM window
@@ -318,13 +354,36 @@ def main():
             machine += f",ble-symfile={symfile}"
 
     cmd = [QEMU, "-M", machine, "-serial", "mon:stdio"]
-    # BLE doorbell bridge: -serial index 1 is the halo-ble chardev (framed
-    # GATT transport; ticket 0030 builds the Lua REPL bridge on it).
+    # -serial index 1 is the halo-ble doorbell chardev (framed GATT
+    # transport).  Two modes:
+    #   default        - the Lua REPL bridge (ticket 0030) owns the
+    #                    doorbell over an internal unix socket and serves
+    #                    the REPL wire protocol on tcp://127.0.0.1:9563;
+    #   --ble-port N   - raw doorbell framing on TCP for low-level tests
+    #                    (tests/smoke_ble.py); the REPL bridge is off.
+    bridge = None
+    bridge_dir = None
     if rom_stub and args.ble_port:
         cmd += ["-serial",
                 f"tcp:127.0.0.1:{args.ble_port},server=on,wait=off"]
-        print(f"halo-emu: BLE doorbell bridge on "
-              f"tcp://127.0.0.1:{args.ble_port}", file=sys.stderr)
+        print(f"halo-emu: raw BLE doorbell on "
+              f"tcp://127.0.0.1:{args.ble_port} (REPL bridge off)",
+              file=sys.stderr)
+    elif rom_stub and args.repl_port:
+        sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
+        from ble_bridge import ReplBridge
+        bridge_dir = tempfile.mkdtemp(prefix="halo-emu-ble-")
+        doorbell_path = os.path.join(bridge_dir, "doorbell.sock")
+        # wait=on: QEMU blocks until the bridge attaches, so the GATT
+        # database dump the ROM stub emits at boot is never lost.
+        cmd += ["-serial",
+                f"unix:{doorbell_path},server=on,wait=on"]
+        bridge = ReplBridge(
+            doorbell_path, args.repl_port,
+            log=lambda m: print(f"halo-emu: repl-bridge: {m}",
+                                file=sys.stderr))
+        print(f"halo-emu: Lua REPL bridge on "
+              f"tcp://127.0.0.1:{args.repl_port}", file=sys.stderr)
     else:
         cmd += ["-serial", "null"]
     # CDC200 display window (ticket 0029): SDL unless --headless.
@@ -335,11 +394,32 @@ def main():
               "(target remote :1234)", file=sys.stderr)
     cmd += extra
 
-    if args.screenshot:
-        run_screenshot(cmd, args)
-        return
+    if bridge:
+        bridge.start()
 
-    os.execv(QEMU, cmd)
+    try:
+        if args.screenshot:
+            run_screenshot(cmd, args)
+            return
+
+        if bridge is None:
+            os.execv(QEMU, cmd)
+
+        # The bridge lives in this process, so keep it alive alongside
+        # QEMU instead of exec'ing over it.
+        proc = subprocess.Popen(cmd)
+        while True:
+            try:
+                sys.exit(proc.wait())
+            except KeyboardInterrupt:
+                continue  # QEMU owns the terminal; let it shut down
+    finally:
+        if bridge:
+            bridge.stop()
+        if bridge_dir:
+            for f in os.listdir(bridge_dir):
+                os.unlink(os.path.join(bridge_dir, f))
+            os.rmdir(bridge_dir)
 
 
 if __name__ == "__main__":

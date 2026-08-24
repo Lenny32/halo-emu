@@ -30,6 +30,7 @@
 #include "hw/core/sysbus.h"
 #include "system/memory.h"
 #include "system/address-spaces.h"
+#include "system/runstate.h"
 #include "qom/object.h"
 
 #define TYPE_HALO_SE "halo-se"
@@ -66,6 +67,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(HaloSEState, HALO_SE)
 #define SE_SVC_FW_VERSION          103
 #define SE_SVC_GET_TOC_VERSION     200
 #define SE_SVC_GET_RND             400
+#define SE_SVC_BOOT_RESET_CPU      503
+#define SE_SVC_BOOT_RESET_SOC      504
 
 /* get_rnd_svc_t: header @0, u32 send_rnd_length @8, u8 resp_rnd[256] @12 */
 #define SE_RND_MAX_LENGTH          256
@@ -161,6 +164,15 @@ static void halo_se_service(HaloSEState *s, uint32_t req)
     }
     case SE_SVC_HEARTBEAT:
         break;
+    case SE_SVC_BOOT_RESET_CPU:
+    case SE_SVC_BOOT_RESET_SOC: {
+        /* sys_reboot() on the Balletto is an SE service call (the SoC has
+         * no self-reset path from the RTSS): reset the whole machine in
+         * place.  MRAM is a mapped host file, so /lfs survives — exactly
+         * the hardware's cold reboot (ticket 0030, control code 0x02). */
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        break;
+    }
     default:
         /* ack-and-zero: the zeroed struct already reads as success */
         qemu_log_mask(LOG_UNIMP,

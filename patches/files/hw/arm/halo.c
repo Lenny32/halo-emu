@@ -62,6 +62,7 @@
 #include "hw/misc/unimp.h"
 #include "system/address-spaces.h"
 #include "system/system.h"
+#include "system/reset.h"
 #include "qom/object.h"
 
 /* Main CPU / SysTick clock: CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC */
@@ -234,6 +235,23 @@ static void halo_make_ram(MemoryRegion *mr, const char *name,
     memory_region_add_subregion(get_system_memory(), base, mr);
 }
 
+/*
+ * The SE's SoC reset (sys_reboot on the Balletto is an SE service, see
+ * halo_se.c) power-cycles the TCMs: on hardware __noinit data does not
+ * survive a reboot.  Model that by zeroing ITCM and DTCM on every system
+ * reset — otherwise stale noinit magics (e.g. ble_lua's) make the
+ * firmware skip GATT re-registration against the freshly reset ROM stub
+ * and BLE comes back dead.  MRAM (non-volatile) and the ROM window (the
+ * loaded stub image) keep their contents.
+ */
+static void halo_sram_reset(void *opaque)
+{
+    HaloMachineState *hms = opaque;
+
+    memset(memory_region_get_ram_ptr(&hms->itcm), 0, HALO_ITCM_SIZE);
+    memset(memory_region_get_ram_ptr(&hms->dtcm), 0, HALO_DTCM_SIZE);
+}
+
 static void halo_make_alias(MemoryRegion *mr, const char *name,
                             MemoryRegion *orig, hwaddr base)
 {
@@ -252,18 +270,21 @@ static const struct {
     hwaddr base;
     int irq_base;
     uint32_t ngpios;
+    uint32_t in_default;
 } halo_gpio_banks[] = {
-    { "gpio0", 0x49000000, 179, 8 },
-    { "gpio1", 0x49001000, 187, 8 },
-    { "gpio2", 0x49002000, 195, 8 },
-    { "gpio3", 0x49003000, 203, 8 },
-    { "gpio4", 0x49004000, 211, 8 },
-    { "gpio5", 0x49005000, 219, 8 },
-    { "gpio6", 0x49006000, 227, 8 },
-    { "gpio7", 0x49007000, 235, 8 },
-    { "gpio8", 0x49008000, 243, 8 },
-    { "gpio9", 0x49009000, 251, 3 },
-    { "lpgpio", 0x42002000, 171, 2 },
+    { "gpio0", 0x49000000, 179, 8, 0 },
+    { "gpio1", 0x49001000, 187, 8, 0 },
+    { "gpio2", 0x49002000, 195, 8, 0 },
+    { "gpio3", 0x49003000, 203, 8, 0 },
+    { "gpio4", 0x49004000, 211, 8, 0 },
+    { "gpio5", 0x49005000, 219, 8, 0 },
+    { "gpio6", 0x49006000, 227, 8, 0 },
+    { "gpio7", 0x49007000, 235, 8, 0 },
+    { "gpio8", 0x49008000, 243, 8, 0 },
+    { "gpio9", 0x49009000, 251, 3, 0 },
+    /* LPGPIO pin 1 is the button: active low with an external pull-up,
+     * so it idles high (released). */
+    { "lpgpio", 0x42002000, 171, 2, 1u << 1 },
 };
 
 static void halo_create_peripherals(DeviceState *armv7m)
@@ -312,6 +333,8 @@ static void halo_create_peripherals(DeviceState *armv7m)
     for (unsigned i = 0; i < ARRAY_SIZE(halo_gpio_banks); i++) {
         dev = qdev_new("halo-dwgpio");
         qdev_prop_set_uint32(dev, "ngpios", halo_gpio_banks[i].ngpios);
+        qdev_prop_set_uint32(dev, "in-default",
+                             halo_gpio_banks[i].in_default);
         sbd = SYS_BUS_DEVICE(dev);
         sysbus_realize_and_unref(sbd, &error_fatal);
         sysbus_mmio_map(sbd, 0, halo_gpio_banks[i].base);
@@ -482,6 +505,7 @@ static void halo_init(MachineState *machine)
     halo_make_ram(&hms->dtcm, "halo.dtcm", HALO_DTCM_BASE, HALO_DTCM_SIZE);
     halo_make_alias(&hms->dtcm_alias, "halo.dtcm.alias", &hms->dtcm,
                     HALO_DTCM_ALIAS);
+    qemu_register_reset(halo_sram_reset, hms);
 
     /*
      * Background coverage for everything the firmware pokes raw at boot

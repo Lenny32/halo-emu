@@ -19,14 +19,37 @@ tag `archive/native-sim`.
 ./halo-emu --fetch 0.8.8                   # download + run a GitHub release (ticket 0034)
 ```
 
-The Lua REPL is served on `tcp://127.0.0.1:9563` (same wire protocol as before:
-`[u8 channel][u16 LE length][payload]`, MTU 512) from ticket 0030.
+The Lua REPL is served on `tcp://127.0.0.1:9563` by default (ticket 0030,
+`--repl-port`; same wire protocol as the retired native_sim emulator:
+`[u8 channel][u16 LE length][payload]`, channel 0 = REPL/data PDUs, 1 = audio,
+2 = video; MTU 512, `frame.bluetooth.max_length()` = 511; loopback only, one
+client at a time). The bridge (`tools/ble_bridge.py`, running inside
+`halo-emu`) owns the doorbell chardev over an internal unix socket, resolves
+the Lua service handles from the ROM stub's GATT database dump, injects
+CONNECT/pairing when a client attaches, enables the TX/Video/AudioTX
+notifications, and forwards frames both ways with end-to-end backpressure
+(a stalled client stalls the firmware's notify path; nothing is dropped).
+
+Control codes ride channel 0 into the firmware unchanged; 0x02 (reboot) makes
+the guest request an SE SoC reset, which resets the machine in place — MRAM
+(`/lfs`) survives, SRAM (including `__noinit`) is cleared like hardware, the
+firmware boots again and the bridge re-arms for the next client.
+
+Tooling: `tools/repl_smoke.py` (end-to-end gate against a real image),
+`tools/run_emu_tests.py` (runs the unmodified device test-suite from a
+firmware checkout via `pyshim/brilliant_ble`, the phone-library shim).
+Note: a firmware built without git metadata has an empty `frame.GIT_TAG`, and
+tests that `print(frame.GIT_TAG)` with `await_print` hang on any transport
+(hardware included) — `print("")` emits nothing. Build the image from a git
+checkout (`west build -b halo --sysbuild alif/applications/halo`) for the
+full device-test subset.
 
 Since ticket 0028 the synthetic BLE ROM stub (`rom-stub/`, loaded automatically by
-`halo-emu`) unblocks `main()` and exposes a raw GATT **doorbell bridge** on
-`tcp://127.0.0.1:9564` (`--ble-port`): framed `{u8 op, u8 flags, u16 len, payload}`
-messages to connect/pair, inject GATT writes and collect notifications
-(contract: `rom-stub/src/halo_rom_ipc.h`). Ticket 0030's REPL rides on it.
+`halo-emu`) unblocks `main()` and can expose the raw GATT **doorbell bridge** on
+TCP instead (`--ble-port 9564`, which turns the REPL bridge off): framed
+`{u8 op, u8 flags, u16 len, payload}` messages to connect/pair, inject GATT
+writes and collect notifications (contract: `rom-stub/src/halo_rom_ipc.h`).
+Ticket 0030's REPL rides on it.
 
 ---
 
