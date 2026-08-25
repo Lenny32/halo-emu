@@ -40,6 +40,11 @@
  *    (halo_cdc200.c), a DSI-host happy-path fake @ 0x49032000
  *    (halo_dsi.c), and ack-everything I2C1 register-file targets for
  *    the vga020 panel (0x54) and TPS65132 PMIC (0x3E).
+ *  - Audio: I2S0 @ 0x49014000 / IRQ 141 as the speaker (halo_i2s.c),
+ *    sinking to a WAV file and/or the host audio backend; LPPDM
+ *    @ 0x43002000 / IRQ 49 as the microphone (halo_pdm.c), drained by
+ *    QEMU's PL330 at 0x400C0000 (dma2) because the firmware's PDM
+ *    driver has no non-DMA fallback.
  *  - Everything else (CGU/AON/VBAT scratch, EVTRTR, ...) is
  *    background-mapped as unimplemented-device so raw boot-time pokes
  *    trace with `-d unimp` instead of faulting.  With BLE absent the
@@ -85,7 +90,13 @@
 #define HALO_ITCM_SIZE (512 * KiB)
 #define HALO_ITCM_ALIAS 0x58000000
 #define HALO_ROMWIN_BASE 0x00090000 /* synthetic BLE/LC3 ROM window */
-#define HALO_ROMWIN_SIZE 0x000D0000 /* ..0x00160000 */
+/*
+ * ..0x00190000.  The pinned ROM symbols only reach 0x00141000; the rest
+ * is the stub's own text/data, the doorbell rings at 0x00156000 /
+ * 0x0015A000, and — since ticket 0032 — liblc3's ~115 KB of code and
+ * tables above 0x00160000 (rom-stub/rom-stub.ld).
+ */
+#define HALO_ROMWIN_SIZE 0x00100000
 #define HALO_ROMWIN_ALIAS 0x58090000
 #define HALO_DTCM_BASE 0x20000000
 #define HALO_DTCM_SIZE 0x00180000 /* 1.5 MiB incl. .alif_ns @ +0xE0000 */
@@ -126,6 +137,27 @@
 #define HALO_I2C0_IRQ 132
 #define HALO_I2C1_BASE 0x49011000
 #define HALO_I2C1_IRQ 133
+
+/* Audio (ticket 0032): I2S0 speaker path — interrupt/FIFO driven, the
+ * board's i2s0 node has no `dmas` (halo_i2s.c) */
+#define HALO_I2S0_BASE 0x49014000
+#define HALO_I2S0_IRQ 141
+
+/*
+ * Microphone: LPPDM (halo_pdm.c) drained by dma2, the SoC's PL330.
+ * The board wires 5 channels whose completion IRQs are NVIC 0..4, with
+ * the abort line on 32 (boards/arm/halo/halo.dts).  QEMU's PL330
+ * exposes the abort as sysbus IRQ 0 and event N as sysbus IRQ 1+N.
+ */
+#define HALO_PDM_BASE 0x43002000
+#define HALO_PDM_IRQ 49
+#define HALO_DMA2_BASE 0x400C0000
+#define HALO_DMA2_CHANNELS 5
+#define HALO_DMA2_ABORT_IRQ 32
+#define HALO_DMA2_NUM_EVENTS 16
+/* LPPDM_DMA_REQ: the request line the event router maps the LPPDM
+ * watermark onto (dmas = <&dma2 4 30>) */
+#define HALO_PDM_DMA_REQ 30
 
 /* CDC200 display controller + DSI host fake (halo_cdc200.c, halo_dsi.c) */
 #define HALO_CDC200_BASE 0x49031000
@@ -184,15 +216,21 @@ struct HaloMachineState {
     char *mram_file;
     char *rom_file;
     char *ble_symfile;
+    char *i2s_wav_out;
+    char *pdm_wav_in;
+    char *audiodev;
     uint32_t init_svtor;
 
     /* Runtime-controls plumbing (ticket 0031) */
     DeviceState *lpgpio_dev;  /* button on pin 1, active-low */
     DeviceState *gpio0_dev;   /* charge-control output on pin 6 */
     DeviceState *gpio1_dev;   /* charger-state input on pin 3 */
+    DeviceState *gpio8_dev;   /* speaker SD_MODE output on pin 5 */
     DeviceState *adc_dev;
     DeviceState *utimer_dev;
     DeviceState *wdog_dev;
+    DeviceState *i2s_dev;     /* speaker (ticket 0032) */
+    DeviceState *pdm_dev;     /* microphone (ticket 0032) */
     bool button_pressed;
     bool charger_connected;
     bool sram_preserve;       /* skip the TCM zeroing on the next reset */
@@ -390,6 +428,8 @@ static void halo_create_peripherals(HaloMachineState *hms,
             hms->gpio0_dev = dev;
         } else if (!strcmp(halo_gpio_banks[i].name, "gpio1")) {
             hms->gpio1_dev = dev;
+        } else if (!strcmp(halo_gpio_banks[i].name, "gpio8")) {
+            hms->gpio8_dev = dev;
         } else if (!strcmp(halo_gpio_banks[i].name, "lpgpio")) {
             hms->lpgpio_dev = dev;
         }
@@ -449,6 +489,71 @@ static void halo_create_peripherals(HaloMachineState *hms,
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, HALO_DSI_BASE);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, HALO_DSI_IRQ));
+
+    /*
+     * I2S0: the speaker.  Sinks the firmware's PCM stream to a WAV file
+     * and/or the host audio backend, and — the part boot depends on —
+     * raises IRQ 141 so the i2s_sync TX callback runs and
+     * max98357a_audio_trigger_impl() stops burning its 5 s drain
+     * timeout on the startup sound.
+     */
+    dev = qdev_new("halo-i2s");
+    if (hms->i2s_wav_out) {
+        qdev_prop_set_string(dev, "wav-out", hms->i2s_wav_out);
+    }
+    if (hms->audiodev) {
+        qdev_prop_set_string(dev, "audiodev", hms->audiodev);
+    }
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, HALO_I2S0_BASE);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, HALO_I2S0_IRQ));
+    hms->i2s_dev = dev;
+
+    /*
+     * dma2 (PL330) + LPPDM: the microphone.  Zephyr's dma_pl330.c
+     * drives the standard debug interface (DBGINST0/1 + DBGCMD) and
+     * builds DMAWFP/DMALDP/DMAST microcode, which QEMU's model
+     * executes, so the upstream device is used as-is.
+     *  - num_periph_req must cover request 30 (the LPPDM line);
+     *  - PNS must allow it for non-secure channels, otherwise DMAWFP
+     *    faults with PL330_FAULT_CH_PERIPH_ERR.
+     */
+    {
+        DeviceState *dma;
+
+        dma = qdev_new("pl330");
+        qdev_prop_set_uint32(dma, "num_chnls", HALO_DMA2_CHANNELS);
+        qdev_prop_set_uint8(dma, "num_periph_req", 32);
+        qdev_prop_set_uint8(dma, "num_events", HALO_DMA2_NUM_EVENTS);
+        qdev_prop_set_uint32(dma, "PNS", 0xFFFFFFFF);
+        object_property_set_link(OBJECT(dma), "memory",
+                                 OBJECT(get_system_memory()), &error_fatal);
+        sbd = SYS_BUS_DEVICE(dma);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, HALO_DMA2_BASE);
+        sysbus_connect_irq(sbd, 0,
+                           qdev_get_gpio_in(armv7m, HALO_DMA2_ABORT_IRQ));
+        for (unsigned ev = 0; ev < HALO_DMA2_CHANNELS; ev++) {
+            sysbus_connect_irq(sbd, 1 + ev, qdev_get_gpio_in(armv7m, ev));
+        }
+
+        dev = qdev_new("halo-pdm");
+        if (hms->pdm_wav_in) {
+            qdev_prop_set_string(dev, "wav-in", hms->pdm_wav_in);
+        }
+        if (hms->audiodev) {
+            qdev_prop_set_string(dev, "audiodev", hms->audiodev);
+        }
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, HALO_PDM_BASE);
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, HALO_PDM_IRQ));
+        qdev_connect_gpio_out_named(dev, "dma-req", 0,
+                                    qdev_get_gpio_in(dma,
+                                                     HALO_PDM_DMA_REQ));
+        hms->pdm_dev = dev;
+    }
 }
 
 /*
@@ -470,6 +575,12 @@ static void halo_create_peripherals(HaloMachineState *hms,
  *                               forwarded from the UTIMER3 PWM sink
  *   wdt-fire        (bool, wo-ish) writing true injects one watchdog
  *                               timeout (halo_wdog.c)
+ *   speaker-enabled (bool, ro)  MAX98357A SD_MODE (gpio8.5)
+ *   speaker-playing (bool, ro), speaker-rate / speaker-samples
+ *                   (uint32, ro) forwarded from the I2S0 model
+ *   mic-wav-in      (str, rw)   WAV file feeding the microphone
+ *   mic-tone-hz / mic-tone-amplitude (uint32, rw) built-in test tone
+ *   mic-source      (str, ro), mic-samples (uint32, ro)
  *
  * Interactive path: the 'B' key in the QEMU window presses/releases
  * the button (a plain keyboard handler — this machine has no other
@@ -558,6 +669,103 @@ static void halo_get_utimer_uint32(Object *obj, Visitor *v, const char *name,
                                          errp);
     }
     visit_type_uint32(v, name, &value, errp);
+}
+
+static void halo_get_i2s_uint32(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+    uint32_t value = 0;
+
+    if (hms->i2s_dev) {
+        value = object_property_get_uint(OBJECT(hms->i2s_dev), name, errp);
+    }
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void halo_get_pdm_uint32(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+    uint32_t value = 0;
+
+    if (hms->pdm_dev) {
+        value = object_property_get_uint(OBJECT(hms->pdm_dev), name, errp);
+    }
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void halo_set_pdm_uint32(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (!hms->pdm_dev) {
+        error_setg(errp, "machine is not initialized yet");
+        return;
+    }
+    object_property_set_uint(OBJECT(hms->pdm_dev), name, value, errp);
+}
+
+static char *halo_get_mic_str(Object *obj, const char *name, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    if (!hms->pdm_dev) {
+        return g_strdup("");
+    }
+    return object_property_get_str(OBJECT(hms->pdm_dev), name, errp);
+}
+
+static char *halo_get_mic_wav_in(Object *obj, Error **errp)
+{
+    return halo_get_mic_str(obj, "mic-wav-in", errp);
+}
+
+static void halo_set_mic_wav_in(Object *obj, const char *value, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    if (!hms->pdm_dev) {
+        error_setg(errp, "machine is not initialized yet");
+        return;
+    }
+    object_property_set_str(OBJECT(hms->pdm_dev), "mic-wav-in", value, errp);
+}
+
+static char *halo_get_mic_source(Object *obj, Error **errp)
+{
+    return halo_get_mic_str(obj, "mic-source", errp);
+}
+
+static bool halo_get_speaker_playing(Object *obj, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    return hms->i2s_dev &&
+           object_property_get_bool(OBJECT(hms->i2s_dev), "speaker-playing",
+                                    errp);
+}
+
+/* MAX98357A SD_MODE on gpio8.5: the firmware drives it high around a
+ * playback (max98357a_audio_trigger_impl START/STOP), so it is the
+ * amplifier's on/off state as a tester would see it. */
+static bool halo_get_speaker_enabled(Object *obj, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+    uint32_t dr, ddr;
+
+    if (!hms->gpio8_dev) {
+        error_setg(errp, "machine is not initialized yet");
+        return false;
+    }
+    dr = object_property_get_uint(OBJECT(hms->gpio8_dev), "dr", errp);
+    ddr = object_property_get_uint(OBJECT(hms->gpio8_dev), "ddr", errp);
+    return (ddr & (1u << 5)) && (dr & (1u << 5));
 }
 
 static void halo_set_battery_raw(Object *obj, Visitor *v, const char *name,
@@ -861,6 +1069,51 @@ static void halo_set_ble_symfile(Object *obj, const char *value, Error **errp)
     hms->ble_symfile = g_strdup(value);
 }
 
+static char *halo_get_i2s_wav_out(Object *obj, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    return g_strdup(hms->i2s_wav_out);
+}
+
+static void halo_set_i2s_wav_out(Object *obj, const char *value, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    g_free(hms->i2s_wav_out);
+    hms->i2s_wav_out = g_strdup(value);
+}
+
+static char *halo_get_pdm_wav_in(Object *obj, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    return g_strdup(hms->pdm_wav_in);
+}
+
+static void halo_set_pdm_wav_in(Object *obj, const char *value, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    g_free(hms->pdm_wav_in);
+    hms->pdm_wav_in = g_strdup(value);
+}
+
+static char *halo_get_audiodev(Object *obj, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    return g_strdup(hms->audiodev);
+}
+
+static void halo_set_audiodev(Object *obj, const char *value, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    g_free(hms->audiodev);
+    hms->audiodev = g_strdup(value);
+}
+
 static void halo_get_svtor(Object *obj, Visitor *v, const char *name,
                            void *opaque, Error **errp)
 {
@@ -919,6 +1172,24 @@ static void halo_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "ble-symfile",
         "ROM symbol table (rom-stub-v1_2.syms) used to decode stub trap "
         "reports into symbol names");
+    object_class_property_add_str(oc, "i2s-wav-out",
+                                  halo_get_i2s_wav_out,
+                                  halo_set_i2s_wav_out);
+    object_class_property_set_description(oc, "i2s-wav-out",
+        "Write everything the firmware plays through I2S0 to this WAV "
+        "file (16-bit mono, at the rate the guest programmed)");
+    object_class_property_add_str(oc, "pdm-wav-in",
+                                  halo_get_pdm_wav_in,
+                                  halo_set_pdm_wav_in);
+    object_class_property_set_description(oc, "pdm-wav-in",
+        "Feed this WAV file to the microphone instead of silence "
+        "(16-bit, mono or stereo, looped and resampled to whatever "
+        "rate the firmware asks for)");
+    object_class_property_add_str(oc, "audiodev",
+                                  halo_get_audiodev, halo_set_audiodev);
+    object_class_property_set_description(oc, "audiodev",
+        "id of an -audiodev backend for live speaker playback and "
+        "microphone capture; omit for a silent (file-only) machine");
     object_class_property_add(oc, "svtor", "uint32",
                               halo_get_svtor, halo_set_svtor, NULL, NULL);
     object_class_property_set_description(oc, "svtor",
@@ -956,6 +1227,48 @@ static void halo_machine_class_init(ObjectClass *oc, const void *data)
                                    halo_get_wdt_fire, halo_set_wdt_fire);
     object_class_property_set_description(oc, "wdt-fire",
         "Write true to inject one watchdog timeout (NMI + warm reset)");
+
+    /* Audio readouts (ticket 0032) */
+    object_class_property_add_bool(oc, "speaker-enabled",
+                                   halo_get_speaker_enabled, NULL);
+    object_class_property_set_description(oc, "speaker-enabled",
+        "MAX98357A SD_MODE (gpio8.5): true = amplifier powered up");
+    object_class_property_add_bool(oc, "speaker-playing",
+                                   halo_get_speaker_playing, NULL);
+    object_class_property_set_description(oc, "speaker-playing",
+        "I2S0 TX is enabled and clocking samples out");
+    object_class_property_add(oc, "speaker-rate", "uint32",
+                              halo_get_i2s_uint32, NULL, NULL, NULL);
+    object_class_property_set_description(oc, "speaker-rate",
+        "Samples per second the I2S0 TX path is currently draining");
+    object_class_property_add(oc, "speaker-samples", "uint32",
+                              halo_get_i2s_uint32, NULL, NULL, NULL);
+    object_class_property_set_description(oc, "speaker-samples",
+        "Total samples handed to the speaker sink since boot");
+
+    object_class_property_add_str(oc, "mic-wav-in",
+                                  halo_get_mic_wav_in, halo_set_mic_wav_in);
+    object_class_property_set_description(oc, "mic-wav-in",
+        "WAV file feeding the microphone; set to \"\" to stop using one");
+    object_class_property_add(oc, "mic-tone-hz", "uint32",
+                              halo_get_pdm_uint32, halo_set_pdm_uint32,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "mic-tone-hz",
+        "Synthesise a sine of this frequency into the microphone "
+        "(0 = off). A wav-in file takes precedence");
+    object_class_property_add(oc, "mic-tone-amplitude", "uint32",
+                              halo_get_pdm_uint32, halo_set_pdm_uint32,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "mic-tone-amplitude",
+        "Peak amplitude of the microphone tone (0..32767)");
+    object_class_property_add(oc, "mic-samples", "uint32",
+                              halo_get_pdm_uint32, NULL, NULL, NULL);
+    object_class_property_set_description(oc, "mic-samples",
+        "Total samples the microphone has pushed into the LPPDM FIFO");
+    object_class_property_add_str(oc, "mic-source",
+                                  halo_get_mic_source, NULL);
+    object_class_property_set_description(oc, "mic-source",
+        "Where microphone samples come from: wav, tone, host or silence");
 }
 
 static const TypeInfo halo_machine_types[] = {

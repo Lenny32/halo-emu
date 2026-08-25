@@ -65,48 +65,4 @@ GAF_STUB(gapi_isooshm_dp_set_buf)
 GAF_STUB(gapi_isooshm_dp_get_sync)
 GAF_STUB(gapi_isooshm_dp_get_local_time)
 
-/* LC3 codec — int/size_t conventions (see lc3_api.h) */
-int hstub_lc3_api_configure(void)
-{
-    return -1;
-}
-
-int hstub_lc3_api_initialise_encoder(void)
-{
-    return -1;
-}
-
-int hstub_lc3_api_initialise_decoder(void)
-{
-    return -1;
-}
-
-int hstub_lc3_api_encode_frame(void)
-{
-    return -1;
-}
-
-int hstub_lc3_api_decode_frame(void)
-{
-    return -1;
-}
-
-uint16_t hstub_lc3_api_get_byte_count(void)
-{
-    return 0;
-}
-
-size_t hstub_lc3_api_encoder_scratch_size(void)
-{
-    return 0;
-}
-
-size_t hstub_lc3_api_decoder_scratch_size(void)
-{
-    return 0;
-}
-
-size_t hstub_lc3_api_decoder_status_size(void)
-{
-    return 0;
-}
+/* The LC3 codec entry points live in stub_lc3.c (liblc3 glue). */

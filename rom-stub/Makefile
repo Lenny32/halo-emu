@@ -22,12 +22,27 @@ BUILD := build
 SRCS := $(wildcard src/*.c)
 OBJS := $(patsubst src/%.c,$(BUILD)/%.o,$(SRCS))
 
+# LC3 codec: Google's liblc3, fetched by ../init.sh into ../deps/liblc3.
+# The firmware exchanges real LC3 bitstreams with the phone, so the ROM's
+# lc3_api_* entry points need a conformant codec, not a passthrough
+# (rom-stub/src/stub_lc3.c is the ABI glue).
+LC3_SRC := ../deps/liblc3
+LC3_SRCS := $(wildcard $(LC3_SRC)/src/*.c)
+LC3_OBJS := $(patsubst $(LC3_SRC)/src/%.c,$(BUILD)/lc3/%.o,$(LC3_SRCS))
+LC3_LIB := $(BUILD)/liblc3.a
+
 LDS := vendor/lds/rom_symbols_ble_v1_2.lds vendor/lds/rom_symbols_lc3_v1_2.lds
 
-CFLAGS := -mcpu=cortex-m55 -mthumb -Os -g -ffreestanding -fno-builtin \
+# -mfloat-abi=hard: liblc3 is floating point, and hard- and soft-float
+# objects cannot be linked together, so the whole stub uses the FPU the
+# firmware has already enabled in SystemInit (it is hard-float itself).
+ARCHFLAGS := -mcpu=cortex-m55 -mthumb -mfloat-abi=hard
+
+CFLAGS := $(ARCHFLAGS) -Os -g -ffreestanding -fno-builtin \
 	-Wall -Wextra -Wno-unused-parameter \
 	-ffunction-sections -fdata-sections \
 	-Ishim -Isrc \
+	-I$(LC3_SRC)/include \
 	-Ivendor/include \
 	-Ivendor/include/common \
 	-Ivendor/include/ip/hl \
@@ -38,8 +53,17 @@ CFLAGS := -mcpu=cortex-m55 -mthumb -Os -g -ffreestanding -fno-builtin \
 	-Ivendor/include/plf/ble \
 	-Ivendor/include/rwip
 
+# liblc3 is third-party: build it warning-clean-by-omission and let GCC
+# use its float builtins (that turns fabsf/sqrtf/floorf/... into single
+# FPU instructions, so no libm is needed — only libgcc's 64-bit divide
+# is left over).
+LC3_CFLAGS := $(ARCHFLAGS) -Os -g -fno-math-errno \
+	-ffunction-sections -fdata-sections \
+	-I$(LC3_SRC)/include -I$(LC3_SRC)/src
+
 LDFLAGS := -nostdlib -nostartfiles -Wl,--gc-sections -Wl,-T,rom-stub.ld \
 	-Wl,--no-warn-rwx-segments
+LDLIBS := -lgcc
 
 all: $(BUILD)/rom-stub-v1_2.bin $(BUILD)/rom-stub-v1_2.syms
 
@@ -77,6 +101,21 @@ $(BUILD)/fw_dispsmoke.bin: $(BUILD)/fw_dispsmoke.elf
 $(BUILD)/%.o: src/%.c src/stub.h src/halo_rom_ipc.h | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+$(LC3_SRC)/include/lc3.h:
+	@echo "rom-stub: liblc3 missing at $(LC3_SRC) — run ../init.sh" >&2; exit 1
+
+$(BUILD)/lc3/%.o: $(LC3_SRC)/src/%.c $(LC3_SRC)/include/lc3.h | $(BUILD)/lc3
+	$(CC) $(LC3_CFLAGS) -c -o $@ $<
+
+# An archive, so rom-stub.ld can place the codec's text and its ~80 KB of
+# tables in their own region without pattern-matching object paths.
+$(LC3_LIB): $(LC3_OBJS)
+	rm -f $@
+	$(PREFIX)ar rcs $@ $(LC3_OBJS)
+
+$(BUILD)/lc3:
+	mkdir -p $@
+
 # The set of implemented pinned symbols is derived from the objects: every
 # global hstub_<name> gets a veneer at <name>'s pinned address.
 $(BUILD)/implemented.txt: $(OBJS)
@@ -87,10 +126,11 @@ $(BUILD)/veneers.S $(BUILD)/rom-stub-v1_2.syms &: $(BUILD)/implemented.txt $(LDS
 		--veneers $(BUILD)/veneers.S --syms $(BUILD)/rom-stub-v1_2.syms
 
 $(BUILD)/veneers.o: $(BUILD)/veneers.S
-	$(CC) -mcpu=cortex-m55 -mthumb -c -o $@ $<
+	$(CC) $(ARCHFLAGS) -c -o $@ $<
 
-$(BUILD)/rom-stub-v1_2.elf: $(OBJS) $(BUILD)/veneers.o rom-stub.ld
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(BUILD)/veneers.o
+$(BUILD)/rom-stub-v1_2.elf: $(OBJS) $(BUILD)/veneers.o $(LC3_LIB) rom-stub.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(BUILD)/veneers.o \
+		$(LC3_LIB) $(LDLIBS)
 
 $(BUILD)/rom-stub-v1_2.bin: $(BUILD)/rom-stub-v1_2.elf
 	$(OBJCOPY) -O binary $< $@

@@ -1,12 +1,12 @@
 # Halo emulator — target UX and hardware reference
 
 **Status: rebuilding.** The QEMU-based emulator is being implemented ticket by ticket
-(see `README.md`). As of ticket 0031 the real firmware boots all the way through: console
+(see `README.md`). As of ticket 0032 the real firmware boots all the way through: console
 banner + logs, littlefs mounted, BLE up on the synthetic ROM stub, the 256×256 UI in a
-window, the Lua REPL on TCP 9563 and the runtime controls (button, battery, charger, LED,
-reboot, watchdog) on TCP 9562 — `./halo-emu -f zephyr.bin`. Remaining: audio (0032),
-camera (0033), CI + firmware fetch (0034). The retired native_sim emulator lives at git
-tag `archive/native-sim`.
+window, the Lua REPL on TCP 9563, the runtime controls (button, battery, charger, LED,
+reboot, watchdog) on TCP 9562, and audio both ways — speaker, microphone and a working
+LC3 codec — `./halo-emu -f zephyr.bin`. Remaining: camera (0033), CI + firmware fetch
+(0034). The retired native_sim emulator lives at git tag `archive/native-sim`.
 
 ## Target UX
 
@@ -18,6 +18,9 @@ tag `archive/native-sim`.
 ./halo-emu -f fw.bin --flash-erase         # factory reset the data partition
 ./halo-emu -f fw.bin --headless            # no window (CI); --screenshot for captures
 ./halo-emu -f fw.bin --ctl-port 9562       # control socket (ticket 0031; 0 disables)
+./halo-emu -f fw.bin --wav-out spk.wav     # record the speaker (ticket 0032)
+./halo-emu -f fw.bin --wav-in voice.wav    # feed the microphone from a file
+./halo-emu -f fw.bin --audio               # live host playback/capture (SDL; try pa)
 ./halo-emu --fetch 0.8.8                   # download + run a GitHub release (ticket 0034)
 ```
 
@@ -58,9 +61,36 @@ same controls are `qom-get`/`qom-set` on `/machine` (`button-pressed`,
 `charger-connected`, `charge-enabled`, `battery-raw`, `led-duty`,
 `led-period`, `led-on`, `wdt-fire`).
 
+**Audio** (ticket 0032) works in both directions. The speaker is I2S0 driven by the
+interrupt/FIFO path (the board's `i2s0` node has no `dmas`, so there is no DMA to model
+there); samples go to `--wav-out FILE` (16-bit mono, written at a fixed 32 kHz with the
+guest's 8/16 kHz clips upsampled into it, and valid on disk while the emulator runs)
+and/or to the host with `--audio [BACKEND]`. The microphone is the LPPDM drained by
+dma2 — QEMU's PL330 at `0x400C0000`, instantiated because the firmware's PDM driver has
+no non-DMA fallback — and reads from `--wav-in FILE` (looped, resampled), from a built-in
+tone, or from the host when `--audio` is on; the default is silence. The control socket
+adds `mic wav <file>` / `mic tone <hz> [amp]` / `mic silence` / `mic?` and `speaker?`
+(`enabled` is the MAX98357A SD_MODE on gpio8.5). Under QMP the same things are
+`mic-wav-in`, `mic-tone-hz`, `mic-tone-amplitude`, `mic-source`, `mic-samples`,
+`speaker-enabled`, `speaker-playing`, `speaker-rate` and `speaker-samples` on `/machine`.
+Note when injecting a test signal: use a *tone*, not DC — the LPPDM runs with its IIR/FIR
+bypassed but `lua_microphone.c` applies its own DC blocker, so a constant level correctly
+arrives as zeros.
+
+The ROM's **LC3 codec** is real, not a stub: `rom-stub/src/stub_lc3.c` backs the ten
+pinned `lc3_api_*` entry points with Google's liblc3 (pinned + fetched by `init.sh`,
+cross-compiled into the ROM image above `0x00160000`), so `frame.speaker.start{encoder=
+'lc3'}` decodes stock third-party `.lc3` bitstreams and `frame.microphone.start{encoder=
+'lc3'}` produces interoperable ones. The Alif ABI's opaque structs are too small for
+liblc3's contexts, so the codec state lives in the caller-allocated buffers whose sizes
+the ABI asks *us* for (`encoder_scratch_size` / `decoder_status_size`) — no pool, no
+allocator, nothing to survive `ble_stack_init()` zeroing the ROM data region.
+
 Tooling: `tools/repl_smoke.py` (end-to-end gate against a real image),
 `tests/smoke_controls.py` (control-socket gate: button → Lua callbacks,
-battery/charger, wdt-fire), `tools/run_emu_tests.py` (runs the unmodified
+battery/charger, wdt-fire), `tests/smoke_audio.py` (audio gate: startup sound into the
+WAV, injected tone out of `frame.microphone.read()`, PCM playback, LC3 both ways),
+`tools/run_emu_tests.py` (runs the unmodified
 device test-suite from a firmware checkout via `pyshim/brilliant_ble`, the
 phone-library shim; exports `HALO_EMU_CTL` so tests can reach the control
 socket through `brilliant_ble.emu_control()`).
@@ -152,9 +182,15 @@ timeouts; failure skips the splash, non-fatal).
 ## Other peripherals (lazy-init, non-fatal)
 
 I2C0 `0x49010000`/IRQ 132: BMA580 IMU `0x18`, QMC6308 mag `0x2C`. I2C1 `0x49011000`/IRQ
-133: vga020 `0x54`, TPS65132 `0x3E`, PAG7982 camera `0x40`. Audio out: `alif,i2s-sync`
-`0x49014000`/IRQ 141 (ISR in DTCM) + MAX98357A (gpio8.5). Mic: LPPDM `0x43002000`/IRQ 49,
-DMA PL330 `0x400C0000` (IRQs 0-4,32) ch4. Camera: LPCAM `0x43003000`/IRQ 54 (parallel
+133: vga020 `0x54`, TPS65132 `0x3E`, PAG7982 camera `0x40`. **Audio out** (modeled,
+0032): `alif,i2s-sync` `0x49014000`/IRQ 141 (ISR in DTCM) + MAX98357A (gpio8.5); 16-deep
+TX FIFO, trigger 8, `ISR.TXFE` is a level and the driver's ISR refills until the FIFO is
+above it — but TXFE must stay low until the first sample clocks out, or the level IRQ
+raised inside `i2s_send()` re-enters before `tx.running` is set and boot deadlocks.
+**Mic** (modeled, 0032): LPPDM `0x43002000`/IRQ 49, DMA PL330 `0x400C0000` (IRQs 0-4,32)
+ch4, request line 30; the read port at `CH2_CH3_AUDIO_OUT` is width-aware because
+Zephyr's PL330 driver reads it in two 16-bit beats at a fixed address per 32-bit set.
+Camera: LPCAM `0x43003000`/IRQ 54 (parallel
 8-bit). GPIO: DW banks gpio0–9 `0x49000000..0x49009000` (IRQs 179–253), LPGPIO
 `0x42002000` (IRQs 171/172) — **button = LPGPIO pin 1, active-low**. Pinctrl `0x1A603000`/
 `0x42007000` (direct writes, no SE). BLE sync timer UTIMER0 `0x48001000` + EVTRTR

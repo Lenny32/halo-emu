@@ -7,7 +7,7 @@
  * traffic to the emulator's doorbell device (hw/arm/halo_ble.c in the QEMU
  * fork) through two shared rings in the ROM window.
  *
- * Memory layout (inside the ROM window 0x00090000..0x00160000, see
+ * Memory layout (inside the ROM window 0x00090000..0x00190000, see
  * rom-stub.ld — the QEMU machine loads rom-stub-v1_2.bin at 0x00090000):
  *
  *   0x00090000  header (magic/version/ring pointers)
@@ -16,6 +16,7 @@
  *   0x0014E000  .data/.bss
  *   0x00156000  H2G ring (host -> guest: injected GATT writes, connect, ...)
  *   0x0015A000  G2H ring (guest -> host: notifications, events, db dump)
+ *   0x00160000  liblc3 text + tables (ticket 0032, see src/stub_lc3.c)
  *
  * Concurrency: API entry points are called from several firmware threads
  * (main thread during init, the BLE task in rwip_process, SMP/OTA thread,

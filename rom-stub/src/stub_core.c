@@ -44,6 +44,29 @@ void *memset(void *dst, int c, size_t n)
     return stub_memset(dst, c, n);
 }
 
+/* liblc3 (stub_lc3.c) shifts sample histories in place */
+void *memmove(void *dst, const void *src, size_t n)
+{
+    uint8_t *d = dst;
+    const uint8_t *s = src;
+
+    if (d == s || n == 0) {
+        return dst;
+    }
+    if (d < s) {
+        while (n--) {
+            *d++ = *s++;
+        }
+    } else {
+        d += n;
+        s += n;
+        while (n--) {
+            *--d = *--s;
+        }
+    }
+    return dst;
+}
+
 void stub_lock(void)
 {
     if (g_stub.hooks && g_stub.hooks->p_global_int_disable) {

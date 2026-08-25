@@ -10,6 +10,8 @@ QEMU_PIN=v11.1.0
 QEMU_URL=https://gitlab.com/qemu-project/qemu.git
 PIXMAN_PIN=pixman-0.44.2
 PIXMAN_URL=https://gitlab.freedesktop.org/pixman/pixman.git
+LIBLC3_PIN=v1.1.3
+LIBLC3_URL=https://github.com/google/liblc3.git
 
 die() { echo "init.sh: error: $*" >&2; exit 1; }
 note() { echo "init.sh: $*"; }
@@ -83,6 +85,19 @@ if ! command -v arm-none-eabi-gcc >/dev/null 2>&1 && \
     rm -f deps/xpack-gcc.tar.gz
     deps/toolchain/bin/arm-none-eabi-gcc --version | head -1
 fi
+
+# --- LC3 codec for the ROM stub (ticket 0032) --------------------------------
+
+# The firmware exchanges real LC3 bitstreams with the phone, so the synthetic
+# ROM's lc3_api_* entry points are backed by Google's liblc3 rather than
+# stubbed out (rom-stub/src/stub_lc3.c is the ABI glue).  Cross-compiled into
+# the ROM image by rom-stub/Makefile.
+if [ ! -e deps/liblc3/.git ]; then
+    note "cloning liblc3 $LIBLC3_PIN"
+    mkdir -p deps
+    git clone --depth 1 --branch "$LIBLC3_PIN" "$LIBLC3_URL" deps/liblc3
+fi
+[ -e deps/liblc3/include/lc3.h ] || die "deps/liblc3 is not a liblc3 checkout"
 
 # --- QEMU checkout, pinned --------------------------------------------------
 

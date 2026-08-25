@@ -25,6 +25,9 @@ Key strategy points:
 
 - **Secure Enclave**: faked at the MHUv2 mailbox (`0x40040000`/`0x40050000`) with an
   ack-and-zero responder — sufficient for every boot-path call.
+- **LC3**: the same on-chip ROM holds the LC3 codec, and the firmware exchanges real LC3
+  bitstreams with the phone, so its ten pinned entry points are backed by Google's
+  **liblc3** (fetched by `init.sh`, cross-compiled into the ROM stub) rather than stubbed.
 - **BLE**: the firmware's BLE host stack lives in on-chip ROM and is called through 983
   pinned addresses. No device/SWD access exists to dump that ROM, so the **permanent**
   strategy is a **synthetic ROM stub** — our own code linked at those addresses,
@@ -48,7 +51,7 @@ Key strategy points:
 | 0029 | cdc200-display-window | boot logo + live UI in the QEMU window |
 | 0030 | lua-repl-bridge | REPL on TCP 9563; smoke + device tests rewritten |
 | 0031 | inputs-and-controls | button, battery, LED readout, reboot/wdt hooks |
-| 0032 | audio-optional | speaker/mic (optional) |
+| 0032 | audio-optional | speaker to WAV/host audio, mic from WAV/tone, LC3 via liblc3 |
 | 0033 | camera-optional | camera from host files (optional) |
 | 0034 | ci-and-firmware-fetch | `--fetch <version>`, CI smoke |
 

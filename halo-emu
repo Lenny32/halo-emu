@@ -8,6 +8,7 @@ Usage:
              [--headless] [--gdb]
              [--repl-port 9563] [--ble-port <raw port>]
              [--ctl-port 9562]
+             [--wav-out <file>] [--wav-in <file>] [--audio [backend]]
              [--screenshot <png> [--screenshot-after <secs>]]
              [--mcuboot <mcuboot.bin>]
              [-- <extra qemu args>]
@@ -33,6 +34,18 @@ device the way a tester drives hardware.  One command per line, reply
                             (charge-enabled = firmware's gpio0.6)
     led?                    -> ok duty=.. period=.. on=0|1
                             (UTIMER3 PWM: brightness = duty/period)
+    mic wav <file>          feed a 16-bit WAV to the microphone
+                            (looped, resampled to the firmware's rate)
+    mic tone <hz> [amp]     synthesise a sine instead (amp 0..32767,
+                            default 8000). Use a tone, not DC: the Lua
+                            mic path DC-blocks, so a constant level
+                            correctly reads back as zeros
+    mic silence             back to silence (the default)
+    mic?                    -> ok source=wav|tone|host|silence hz=..
+                               amp=.. samples=..
+    speaker?                -> ok enabled=0|1 playing=0|1 rate=..
+                               samples=..  (enabled = MAX98357A
+                               SD_MODE on gpio8.5)
     reboot                  full machine reset (MRAM/lfs preserved)
     wdt-fire                inject a watchdog timeout: NMI, then a
                             TCM-preserving warm reset 200 ms later
@@ -48,6 +61,16 @@ MTU 512, one client at a time, loopback only.  --ble-port N exposes the
 raw doorbell framing instead (tests/smoke_ble.py).  Both unsigned
 zephyr.bin (vector table at image offset 0) and imgtool-padded images
 (offset 0x800) work — the vector offset is auto-detected.
+
+Audio (ticket 0032) is off unless asked for.  --wav-out records
+everything the firmware plays into a 16-bit mono WAV (written at a fixed
+32 kHz, with the guest's 8/16 kHz clips upsampled into it so one file
+holds a whole session correctly timed; the file stays valid on disk
+while the emulator runs).  --wav-in feeds the microphone from a WAV
+instead of silence.  --audio [backend] attaches a QEMU -audiodev
+(default sdl) for live playback and host capture.  The ROM stub carries
+a real LC3 codec, so the `encoder='lc3'` speaker and microphone modes
+work and interoperate with stock .lc3 bitstreams.
 
 The 256x256 panel (CDC200) shows up as the QEMU SDL window; --headless
 (-display none) drops the window but the display model still runs, so
@@ -199,6 +222,20 @@ def parse_args():
                         "rom-stub/build/rom-stub-v1_2.bin if built; "
                         "'none' to boot without one — main() then parks "
                         "in alif_ble_enable())")
+    p.add_argument("--wav-out", metavar="FILE",
+                   help="record everything the firmware plays through the "
+                        "speaker (I2S0) into this 16-bit mono WAV; the "
+                        "file stays valid while the emulator runs")
+    p.add_argument("--wav-in", metavar="FILE",
+                   help="feed this 16-bit WAV to the microphone instead of "
+                        "silence (looped, resampled to whatever rate the "
+                        "firmware asks for); `mic wav <file>` on the "
+                        "control socket swaps it at runtime")
+    p.add_argument("--audio", nargs="?", const="sdl", metavar="BACKEND",
+                   help="live host audio: attaches an -audiodev of this "
+                        "type (default sdl; try pa or alsa) for speaker "
+                        "playback and microphone capture. Off by default, "
+                        "so CI and --headless runs stay silent")
     p.add_argument("--mcuboot", metavar="BIN",
                    help="chain-boot spike: load this mcuboot at MRAM 0 "
                         "and vector from 0x80000000")
@@ -438,6 +475,49 @@ class CtlServer(threading.Thread):
             return "ok"
         return "err usage: charger on|off|?"
 
+    def _verb_mic(self, args):
+        if args == ["?"]:
+            src = self._get("mic-source")
+            hz = self._get("mic-tone-hz")
+            amp = self._get("mic-tone-amplitude")
+            samples = self._get("mic-samples")
+            return (f"ok source={src} hz={hz} amp={amp} "
+                    f"samples={samples}")
+        if args == ["silence"]:
+            self._set("mic-wav-in", "")
+            self._set("mic-tone-hz", 0)
+            return "ok"
+        if len(args) == 2 and args[0] == "wav":
+            path = os.path.abspath(args[1])
+            if not os.path.exists(path):
+                return f"err no such file: {path}"
+            # A file always wins over the tone; clear it so `mic?`
+            # reports the source honestly.
+            self._set("mic-tone-hz", 0)
+            self._set("mic-wav-in", path)
+            return "ok"
+        if args and args[0] == "tone" and len(args) in (2, 3):
+            hz = int(args[1])
+            if not 0 < hz <= 20000:
+                return "err tone frequency out of range (1..20000 Hz)"
+            amp = int(args[2]) if len(args) == 3 else 8000
+            if not 0 <= amp <= 32767:
+                return "err amplitude out of range (0..32767)"
+            self._set("mic-wav-in", "")
+            self._set("mic-tone-amplitude", amp)
+            self._set("mic-tone-hz", hz)
+            return "ok"
+        return "err usage: mic wav <file> | mic tone <hz> [amp] | " \
+               "mic silence | mic?"
+
+    def _verb_speaker(self, args):
+        en = int(self._get("speaker-enabled"))
+        playing = int(self._get("speaker-playing"))
+        rate = self._get("speaker-rate")
+        samples = self._get("speaker-samples")
+        return (f"ok enabled={en} playing={playing} rate={rate} "
+                f"samples={samples}")
+
     def _verb_led(self, args):
         duty = self._get("led-duty")
         period = self._get("led-period")
@@ -461,6 +541,10 @@ class CtlServer(threading.Thread):
                 return self._verb_charger(args)
             if verb == "led" and args == ["?"]:
                 return self._verb_led(args)
+            if verb == "speaker" and args == ["?"]:
+                return self._verb_speaker(args)
+            if verb == "mic":
+                return self._verb_mic(args)
             if verb == "reboot" and not args:
                 self._cmd("system_reset")
                 return "ok"
@@ -616,7 +700,20 @@ def main():
         if os.path.exists(symfile):
             machine += f",ble-symfile={symfile}"
 
+    # Audio (ticket 0032): the WAV capture is a machine option; live host
+    # playback/capture needs an -audiodev backend the models can open.
+    if args.wav_out:
+        machine += f",i2s-wav-out={args.wav_out}"
+    if args.wav_in:
+        if not os.path.exists(args.wav_in):
+            die(f"--wav-in file not found: {args.wav_in}")
+        machine += f",pdm-wav-in={os.path.abspath(args.wav_in)}"
+    if args.audio:
+        machine += ",audiodev=halo"
+
     cmd = [QEMU, "-M", machine, "-serial", "mon:stdio"]
+    if args.audio:
+        cmd += ["-audiodev", f"{args.audio},id=halo"]
     # -serial index 1 is the halo-ble doorbell chardev (framed GATT
     # transport).  Two modes:
     #   default        - the Lua REPL bridge (ticket 0030) owns the
