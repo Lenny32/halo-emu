@@ -65,10 +65,11 @@ struct HaloDwGpioState {
     uint32_t debounce;
     uint32_t ls_sync;
     uint32_t ext_in;       /* external input levels */
+    bool ext_in_valid;     /* ext_in seeded from in_default */
     uint32_t raw_int;      /* latched edges + live levels */
 
     uint32_t ngpios;
-    uint32_t in_default;   /* reset level of the external inputs */
+    uint32_t in_default;   /* power-on level of the external inputs */
 };
 
 static uint32_t halo_dwgpio_ext(HaloDwGpioState *s)
@@ -222,7 +223,13 @@ static void halo_dwgpio_reset(DeviceState *dev)
     s->int_bothedge = 0;
     s->debounce = 0;
     s->ls_sync = 0;
-    s->ext_in = s->in_default;
+    /* ext_in is the state of the external world: seed it from
+     * in-default on the first (power-on) reset only — a system reset
+     * must not release a button the control socket is holding down. */
+    if (!s->ext_in_valid) {
+        s->ext_in = s->in_default;
+        s->ext_in_valid = true;
+    }
     s->raw_int = 0;
     halo_dwgpio_update(s);
 }
@@ -240,6 +247,11 @@ static void halo_dwgpio_init(Object *obj)
     }
     qdev_init_gpio_in_named(DEVICE(obj), halo_dwgpio_input_set, "in",
                             DWGPIO_MAX_PINS);
+    /* Output readout for the control socket (charge-control on
+     * gpio0.6 is firmware-driven: tri-stated input = charging allowed,
+     * output-low = charging cut) */
+    object_property_add_uint32_ptr(obj, "dr", &s->dr, OBJ_PROP_FLAG_READ);
+    object_property_add_uint32_ptr(obj, "ddr", &s->ddr, OBJ_PROP_FLAG_READ);
 }
 
 static const Property halo_dwgpio_properties[] = {

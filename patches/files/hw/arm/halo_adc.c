@@ -14,10 +14,13 @@
  * AON windows) is plain register storage; the driver has no readback
  * checks or polling loops.
  *
- * The sample value is a qdev property ("battery-raw", 0..4095).  The
- * firmware computes mV = raw * 1800 / 4095 scaled by the 2.4k/1k
- * divider, i.e. Vbat_mV = raw * 4320 / 4095; the default 3698 reads as
- * a healthy 3.9 V battery (66%).
+ * The sample value is a runtime QOM property ("battery-raw", 0..4095,
+ * settable any time via qom-set — the machine forwards its own
+ * "battery-raw" property here for the control socket).  The firmware
+ * computes mV = raw * 1800 / 4095 scaled by the 2.4k/1k divider, i.e.
+ * Vbat_mV = raw * 4320 / 4095; the default 3698 reads as a healthy
+ * 3.9 V battery.  The firmware samples every 10 s, so a change shows
+ * up in frame.battery_voltage() within one poll.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -25,7 +28,6 @@
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
-#include "hw/core/qdev-properties.h"
 #include "system/memory.h"
 #include "qom/object.h"
 
@@ -244,19 +246,21 @@ static void halo_adc_init(Object *obj)
                           "halo-adc.aon", 0x100);
     sysbus_init_mmio(sbd, &s->aon_iomem);
     sysbus_init_irq(sbd, &s->done1_irq);
-}
 
-/* raw = Vbat_mV * 4095 / 4320; 3698 == 3.9 V through the 2.4k/1k divider */
-static const Property halo_adc_properties[] = {
-    DEFINE_PROP_UINT32("battery-raw", HaloAdcState, battery_raw, 3698),
-};
+    /* raw = Vbat_mV * 4095 / 4320; 3698 == 3.9 V through the divider.
+     * A plain object property (not a qdev one) so it stays writable
+     * after realize; deliberately not touched by reset — a set level
+     * survives guest reboots like a physical battery would. */
+    s->battery_raw = 3698;
+    object_property_add_uint32_ptr(obj, "battery-raw", &s->battery_raw,
+                                   OBJ_PROP_FLAG_READWRITE);
+}
 
 static void halo_adc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     device_class_set_legacy_reset(dc, halo_adc_reset);
-    device_class_set_props(dc, halo_adc_properties);
 }
 
 static const TypeInfo halo_adc_types[] = {

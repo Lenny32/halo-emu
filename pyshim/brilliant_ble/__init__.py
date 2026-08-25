@@ -47,6 +47,32 @@ def _emu_addr():
     return host or "127.0.0.1", int(port)
 
 
+def emu_control(*commands, timeout=90.0):
+    """Emulator-only escape hatch (not part of the real phone library):
+    send text verbs to halo-emu's control socket (ticket 0031) — e.g.
+    emu_control("button click"), emu_control("battery set 82%") — and
+    return the reply lines.  Address: $HALO_EMU_CTL (default
+    127.0.0.1:9562, run_emu_tests.py exports it).  Raises RuntimeError
+    on an `err` reply.  The generous default timeout covers `button
+    hold <ms>` verbs, which reply only after the release."""
+    import socket
+
+    addr = os.environ.get("HALO_EMU_CTL", "127.0.0.1:9562")
+    host, _, port = addr.rpartition(":")
+    replies = []
+    with socket.create_connection((host or "127.0.0.1", int(port)),
+                                  timeout=timeout) as sock:
+        f = sock.makefile("rw", encoding="utf-8", newline="\n")
+        for cmd in commands:
+            f.write(cmd.strip() + "\n")
+            f.flush()
+            reply = f.readline().strip()
+            if not reply.startswith("ok"):
+                raise RuntimeError(f"emu_control({cmd!r}): {reply}")
+            replies.append(reply)
+    return replies
+
+
 def chunk_lua_string(payload: bytes, max_chunk_bytes: int) -> List[str]:
     """Split escaped-Lua-string bytes into chunks that never cut a
     multi-byte UTF-8 sequence or a Lua escape (verbatim semantics of the

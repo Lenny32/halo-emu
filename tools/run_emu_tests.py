@@ -87,16 +87,18 @@ class Emulator:
     """halo-emu under our control, relaunched on exit (reboot = the
     machine resets in place, but a QEMU exit must not kill the run)."""
 
-    def __init__(self, firmware, flash, port):
+    def __init__(self, firmware, flash, port, ctl_port):
         self.firmware = firmware
         self.flash = flash
         self.port = port
+        self.ctl_port = ctl_port
         self.proc = None
 
     def launch(self):
         self.proc = subprocess.Popen(
             [HALO_EMU, "-f", self.firmware, "--flash", self.flash,
-             "--headless", "--repl-port", str(self.port)],
+             "--headless", "--repl-port", str(self.port),
+             "--ctl-port", str(self.ctl_port)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def ensure_running(self):
@@ -118,11 +120,12 @@ class Emulator:
                 self.proc.wait()
 
 
-def run_test(tests_dir, name, port, timeout):
+def run_test(tests_dir, name, port, ctl_port, timeout):
     env = dict(os.environ,
                PYTHONPATH=PYSHIM + os.pathsep +
                os.environ.get("PYTHONPATH", ""),
                HALO_EMU_ADDR=f"127.0.0.1:{port}",
+               HALO_EMU_CTL=f"127.0.0.1:{ctl_port}",
                PYTHONUNBUFFERED="1")
     started = time.monotonic()
     runner = [UV, "run"] if UV else [sys.executable]
@@ -162,6 +165,9 @@ def main():
     p.add_argument("--only",
                    help="comma-separated test file names to run")
     p.add_argument("--port", type=int, default=9563)
+    p.add_argument("--ctl-port", type=int, default=9562,
+                   help="control socket port (button/battery/... verbs); "
+                        "exported to the tests as HALO_EMU_CTL")
     p.add_argument("--keep-flash", metavar="IMG",
                    help="use (and keep) this MRAM image instead of a "
                         "fresh throwaway one")
@@ -188,14 +194,14 @@ def main():
     else:
         flash = tempfile.mktemp(prefix="halo-emu-tests-", suffix=".img")
 
-    emu = Emulator(args.firmware, flash, args.port)
+    emu = Emulator(args.firmware, flash, args.port, args.ctl_port)
     results = []
     try:
         emu.ensure_running()
         for name in selection:
             emu.ensure_running()
             ok, secs, why, text = run_test(
-                tests_dir, name, args.port,
+                tests_dir, name, args.port, args.ctl_port,
                 TIMEOUTS.get(name, DEFAULT_TIMEOUT))
             mark = f"{GREEN}PASS{RESET}" if ok else f"{RED}FAIL{RESET}"
             print(f"{mark} {name:34s} {secs:6.1f}s"

@@ -28,11 +28,14 @@
  *    receiver 0x40040000 / IRQ 37) with an ack-and-zero Secure Enclave
  *    responder behind it (halo_se.c).
  *  - Boot-critical peripherals (see the halo_*.c models): CMSDK
- *    watchdog stub (never fires), DW APB RTC (the tickless-idle
- *    counter), Alif ADC12 with a configurable battery voltage, UTIMER3
- *    as a PWM sink for the LED, eleven DW GPIO banks, and two DW I2C
+ *    watchdog stub (never expires on its own; wdt-fire injects one
+ *    timeout), DW APB RTC (the tickless-idle counter), Alif ADC12 with
+ *    a runtime-settable battery voltage, UTIMER3 as a PWM sink for the
+ *    LED (duty readable), eleven DW GPIO banks, and two DW I2C
  *    controllers backed by QEMU I2C buses (absent addresses NACK
- *    cleanly).
+ *    cleanly).  Runtime controls (button, charger, battery, LED, wdt)
+ *    are QOM properties on /machine — see the block above
+ *    halo_button_drive() — driven by halo-emu's control socket.
  *  - Display: CDC200 controller @ 0x49031000 as a QEMU graphic console
  *    (halo_cdc200.c), a DSI-host happy-path fake @ 0x49032000
  *    (halo_dsi.c), and ack-everything I2C1 register-file targets for
@@ -58,12 +61,15 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/char/serial-mm.h"
+#include "hw/core/irq.h"
 #include "hw/i2c/i2c.h"
 #include "hw/misc/unimp.h"
 #include "system/address-spaces.h"
 #include "system/system.h"
 #include "system/reset.h"
 #include "qom/object.h"
+#include "ui/input.h"
+#include "halo.h"
 
 /* Main CPU / SysTick clock: CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC */
 #define HALO_SYSCLK_FRQ 160000000
@@ -179,6 +185,17 @@ struct HaloMachineState {
     char *rom_file;
     char *ble_symfile;
     uint32_t init_svtor;
+
+    /* Runtime-controls plumbing (ticket 0031) */
+    DeviceState *lpgpio_dev;  /* button on pin 1, active-low */
+    DeviceState *gpio0_dev;   /* charge-control output on pin 6 */
+    DeviceState *gpio1_dev;   /* charger-state input on pin 3 */
+    DeviceState *adc_dev;
+    DeviceState *utimer_dev;
+    DeviceState *wdog_dev;
+    bool button_pressed;
+    bool charger_connected;
+    bool sram_preserve;       /* skip the TCM zeroing on the next reset */
 };
 
 #define TYPE_HALO_MACHINE MACHINE_TYPE_NAME("halo")
@@ -235,6 +252,19 @@ static void halo_make_ram(MemoryRegion *mr, const char *name,
     memory_region_add_subregion(get_system_memory(), base, mr);
 }
 
+/* Singleton back-pointer for the cross-model hook below (max_cpus = 1,
+ * one machine per process). */
+static HaloMachineState *halo_machine;
+
+/* halo.h: a CMSDK-watchdog reset (halo_wdog.c) is warm — the TCMs and
+ * with them the firmware's watchdog-fired __noinit magic survive. */
+void halo_sram_preserve_next_reset(void)
+{
+    if (halo_machine) {
+        halo_machine->sram_preserve = true;
+    }
+}
+
 /*
  * The SE's SoC reset (sys_reboot on the Balletto is an SE service, see
  * halo_se.c) power-cycles the TCMs: on hardware __noinit data does not
@@ -242,12 +272,19 @@ static void halo_make_ram(MemoryRegion *mr, const char *name,
  * reset — otherwise stale noinit magics (e.g. ble_lua's) make the
  * firmware skip GATT re-registration against the freshly reset ROM stub
  * and BLE comes back dead.  MRAM (non-volatile) and the ROM window (the
- * loaded stub image) keep their contents.
+ * loaded stub image) keep their contents.  A watchdog reset skips the
+ * zeroing once (sram_preserve, set by halo_wdog.c).  The GPIO banks
+ * keep their external input levels across resets themselves (a held
+ * button stays held through a reboot, see halo_gpio.c).
  */
 static void halo_sram_reset(void *opaque)
 {
     HaloMachineState *hms = opaque;
 
+    if (hms->sram_preserve) {
+        hms->sram_preserve = false;
+        return;
+    }
     memset(memory_region_get_ram_ptr(&hms->itcm), 0, HALO_ITCM_SIZE);
     memset(memory_region_get_ram_ptr(&hms->dtcm), 0, HALO_DTCM_SIZE);
 }
@@ -287,7 +324,8 @@ static const struct {
     { "lpgpio", 0x42002000, 171, 2, 1u << 1 },
 };
 
-static void halo_create_peripherals(DeviceState *armv7m)
+static void halo_create_peripherals(HaloMachineState *hms,
+                                    DeviceState *armv7m)
 {
     SysBusDevice *sbd;
     DeviceState *dev;
@@ -301,11 +339,15 @@ static void halo_create_peripherals(DeviceState *armv7m)
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, HALO_MHU_RECV_IRQ));
     sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(armv7m, HALO_MHU_SEND_IRQ));
 
-    /* watchdog stub: armed and fed by the firmware, never fires */
+    /* watchdog stub: armed and fed by the firmware; never expires on
+     * its own, but the control socket's wdt-fire verb injects one full
+     * timeout (NMI, then the RESEN warm reset — see halo_wdog.c) */
     dev = qdev_new("halo-wdog");
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, HALO_WDOG_BASE);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in_named(armv7m, "NMI", 0));
+    hms->wdog_dev = dev;
 
     /* DW APB RTC: the cortex-m idle timer */
     dev = qdev_new("halo-rtc");
@@ -322,6 +364,7 @@ static void halo_create_peripherals(DeviceState *armv7m)
     sysbus_mmio_map(sbd, 1, HALO_ADC_COMP_BASE);
     sysbus_mmio_map(sbd, 2, HALO_ADC_AON_BASE);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, HALO_ADC_DONE1_IRQ));
+    hms->adc_dev = dev;
 
     /* UTIMER3 PWM sink (LED duty cycle recorder) */
     dev = qdev_new("halo-utimer");
@@ -329,6 +372,7 @@ static void halo_create_peripherals(DeviceState *armv7m)
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, HALO_UTIMER3_BASE);
     sysbus_mmio_map(sbd, 1, HALO_UTIMER_GLB_BASE);
+    hms->utimer_dev = dev;
 
     for (unsigned i = 0; i < ARRAY_SIZE(halo_gpio_banks); i++) {
         dev = qdev_new("halo-dwgpio");
@@ -341,6 +385,13 @@ static void halo_create_peripherals(DeviceState *armv7m)
         for (unsigned pin = 0; pin < halo_gpio_banks[i].ngpios; pin++) {
             sysbus_connect_irq(sbd, pin,
                 qdev_get_gpio_in(armv7m, halo_gpio_banks[i].irq_base + pin));
+        }
+        if (!strcmp(halo_gpio_banks[i].name, "gpio0")) {
+            hms->gpio0_dev = dev;
+        } else if (!strcmp(halo_gpio_banks[i].name, "gpio1")) {
+            hms->gpio1_dev = dev;
+        } else if (!strcmp(halo_gpio_banks[i].name, "lpgpio")) {
+            hms->lpgpio_dev = dev;
         }
     }
 
@@ -399,6 +450,177 @@ static void halo_create_peripherals(DeviceState *armv7m)
     sysbus_mmio_map(sbd, 0, HALO_DSI_BASE);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, HALO_DSI_IRQ));
 }
+
+/*
+ * Runtime controls (ticket 0031): everything scriptable hangs off the
+ * stable QOM path /machine as plain object properties, so the control
+ * plane is generic QMP qom-get/qom-set — no QAPI schema additions:
+ *
+ *   button-pressed  (bool, rw)  the LPGPIO-1 button, true = held down
+ *                               (active-low: drives the pin to 0)
+ *   charger-connected (bool, rw) charger STAT on gpio1.3 — the pin is
+ *                               physically high while charging (the
+ *                               vbat driver double-inverts its
+ *                               ACTIVE_LOW flag)
+ *   charge-enabled  (bool, ro)  the firmware's charge-control output
+ *                               (gpio0.6): false when driven low
+ *   battery-raw     (uint32, rw) forwarded to the ADC model; the
+ *                               firmware samples every 10 s
+ *   led-duty / led-period (uint32, ro), led-on (bool, ro)
+ *                               forwarded from the UTIMER3 PWM sink
+ *   wdt-fire        (bool, wo-ish) writing true injects one watchdog
+ *                               timeout (halo_wdog.c)
+ *
+ * Interactive path: the 'B' key in the QEMU window presses/releases
+ * the button (a plain keyboard handler — this machine has no other
+ * keyboard device, so every UI key event lands here).
+ */
+
+static void halo_button_drive(HaloMachineState *hms, bool pressed)
+{
+    hms->button_pressed = pressed;
+    qemu_set_irq(qdev_get_gpio_in_named(hms->lpgpio_dev, "in", 1), !pressed);
+}
+
+static bool halo_get_button(Object *obj, Error **errp)
+{
+    return HALO_MACHINE(obj)->button_pressed;
+}
+
+static void halo_set_button(Object *obj, bool value, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    if (!hms->lpgpio_dev) {
+        error_setg(errp, "machine is not initialized yet");
+        return;
+    }
+    halo_button_drive(hms, value);
+}
+
+static bool halo_get_charger(Object *obj, Error **errp)
+{
+    return HALO_MACHINE(obj)->charger_connected;
+}
+
+static void halo_set_charger(Object *obj, bool value, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    if (!hms->gpio1_dev) {
+        error_setg(errp, "machine is not initialized yet");
+        return;
+    }
+    hms->charger_connected = value;
+    qemu_set_irq(qdev_get_gpio_in_named(hms->gpio1_dev, "in", 3), value);
+}
+
+static bool halo_get_charge_enabled(Object *obj, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+    uint32_t dr, ddr;
+
+    if (!hms->gpio0_dev) {
+        error_setg(errp, "machine is not initialized yet");
+        return false;
+    }
+    dr = object_property_get_uint(OBJECT(hms->gpio0_dev), "dr", errp);
+    ddr = object_property_get_uint(OBJECT(hms->gpio0_dev), "ddr", errp);
+    /* tri-stated input (or driven high) = charging allowed;
+     * output-low = charging cut (alif_vbat.c charge_control()) */
+    return !(ddr & (1u << 6)) || (dr & (1u << 6));
+}
+
+/* Forwarders to per-device properties (uint32 needs the visitor API).
+ * The machine property names match the device property names, so the
+ * getter can forward by `name`. */
+
+static void halo_get_adc_uint32(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+    uint32_t value = 0;
+
+    if (hms->adc_dev) {
+        value = object_property_get_uint(OBJECT(hms->adc_dev), name, errp);
+    }
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void halo_get_utimer_uint32(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+    uint32_t value = 0;
+
+    if (hms->utimer_dev) {
+        value = object_property_get_uint(OBJECT(hms->utimer_dev), name,
+                                         errp);
+    }
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void halo_set_battery_raw(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (!hms->adc_dev) {
+        error_setg(errp, "machine is not initialized yet");
+        return;
+    }
+    object_property_set_uint(OBJECT(hms->adc_dev), name, value, errp);
+}
+
+static bool halo_get_led_on(Object *obj, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    return hms->utimer_dev &&
+           object_property_get_bool(OBJECT(hms->utimer_dev), "led-on", errp);
+}
+
+static bool halo_get_wdt_fire(Object *obj, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    return hms->wdog_dev &&
+           object_property_get_bool(OBJECT(hms->wdog_dev), "fire", errp);
+}
+
+static void halo_set_wdt_fire(Object *obj, bool value, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    if (!hms->wdog_dev) {
+        error_setg(errp, "machine is not initialized yet");
+        return;
+    }
+    object_property_set_bool(OBJECT(hms->wdog_dev), "fire", value, errp);
+}
+
+static void halo_key_event(DeviceState *dev, QemuConsole *src,
+                           QemuInputEvent *evt)
+{
+    HaloMachineState *hms = halo_machine;
+
+    if (!hms || !hms->lpgpio_dev || evt->type != INPUT_EVENT_KIND_KEY) {
+        return;
+    }
+    if (qemu_input_linux_to_qcode(evt->key.key) == Q_KEY_CODE_B) {
+        halo_button_drive(hms, evt->key.down);
+    }
+}
+
+static const QemuInputHandler halo_button_input_handler = {
+    .name = "halo-button",
+    .mask = INPUT_EVENT_MASK_KEY,
+    .event = halo_key_event,
+};
 
 /*
  * BLE doorbell: transport between the synthetic ROM stub and the host.
@@ -573,10 +795,16 @@ static void halo_init(MachineState *machine)
                    HALO_UART3_CLK / 16, serial_hd(0), DEVICE_LITTLE_ENDIAN);
 
     /* SE fake + boot-critical peripheral models */
-    halo_create_peripherals(armv7m);
+    halo_create_peripherals(hms, armv7m);
 
     /* BLE doorbell (synthetic ROM stub transport) */
     halo_create_ble(hms, armv7m);
+
+    /* Runtime controls: singleton hook for halo_wdog.c + the 'B'-key
+     * button binding in the UI window */
+    halo_machine = hms;
+    qemu_input_handler_activate(
+        qemu_input_handler_register(NULL, &halo_button_input_handler));
 
     /*
      * Raw app image (zephyr.bin / zephyr.signed.bin) into MRAM slot 0.
@@ -696,6 +924,38 @@ static void halo_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "svtor",
         "Reset vector table address (default 0x80020800 = app slot0; "
         "0x80000000 for mcuboot chain-boot)");
+
+    /* Runtime controls (ticket 0031) — driven over QMP qom-set/qom-get
+     * by the halo-emu control socket */
+    object_class_property_add_bool(oc, "button-pressed",
+                                   halo_get_button, halo_set_button);
+    object_class_property_set_description(oc, "button-pressed",
+        "The hardware button (LPGPIO pin 1, active-low): true = held");
+    object_class_property_add_bool(oc, "charger-connected",
+                                   halo_get_charger, halo_set_charger);
+    object_class_property_set_description(oc, "charger-connected",
+        "Charger STAT input (gpio1.3): true = charging");
+    object_class_property_add_bool(oc, "charge-enabled",
+                                   halo_get_charge_enabled, NULL);
+    object_class_property_set_description(oc, "charge-enabled",
+        "Firmware charge-control output (gpio0.6): false = charge cut");
+    object_class_property_add(oc, "battery-raw", "uint32",
+                              halo_get_adc_uint32, halo_set_battery_raw,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "battery-raw",
+        "Battery ADC sample (0..4095); Vbat_mV = raw * 4320 / 4095");
+    object_class_property_add(oc, "led-duty", "uint32",
+                              halo_get_utimer_uint32, NULL, NULL, NULL);
+    object_class_property_add(oc, "led-period", "uint32",
+                              halo_get_utimer_uint32, NULL, NULL, NULL);
+    object_class_property_add_bool(oc, "led-on",
+                                   halo_get_led_on, NULL);
+    object_class_property_set_description(oc, "led-on",
+        "LED PWM driver enabled (UTIMER3 COMPARE_CTRL_A.DRIVER_EN)");
+    object_class_property_add_bool(oc, "wdt-fire",
+                                   halo_get_wdt_fire, halo_set_wdt_fire);
+    object_class_property_set_description(oc, "wdt-fire",
+        "Write true to inject one watchdog timeout (NMI + warm reset)");
 }
 
 static const TypeInfo halo_machine_types[] = {

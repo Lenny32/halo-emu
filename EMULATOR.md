@@ -1,10 +1,11 @@
 # Halo emulator — target UX and hardware reference
 
 **Status: rebuilding.** The QEMU-based emulator is being implemented ticket by ticket
-(see `README.md`). As of ticket 0026 the real firmware boots to its pre-BLE limit:
-banner + logs on the console, littlefs mounted, main() parked in `alif_ble_enable()`
-(run `qemu/build/qemu-system-arm -M halo -kernel zephyr.bin -serial stdio -display none`;
-the `halo-emu` launcher is ticket 0027). The retired native_sim emulator lives at git
+(see `README.md`). As of ticket 0031 the real firmware boots all the way through: console
+banner + logs, littlefs mounted, BLE up on the synthetic ROM stub, the 256×256 UI in a
+window, the Lua REPL on TCP 9563 and the runtime controls (button, battery, charger, LED,
+reboot, watchdog) on TCP 9562 — `./halo-emu -f zephyr.bin`. Remaining: audio (0032),
+camera (0033), CI + firmware fetch (0034). The retired native_sim emulator lives at git
 tag `archive/native-sim`.
 
 ## Target UX
@@ -16,6 +17,7 @@ tag `archive/native-sim`.
 ./halo-emu -f fw.bin --flash mram.img      # named persistent MRAM (default ./mram.img)
 ./halo-emu -f fw.bin --flash-erase         # factory reset the data partition
 ./halo-emu -f fw.bin --headless            # no window (CI); --screenshot for captures
+./halo-emu -f fw.bin --ctl-port 9562       # control socket (ticket 0031; 0 disables)
 ./halo-emu --fetch 0.8.8                   # download + run a GitHub release (ticket 0034)
 ```
 
@@ -35,9 +37,33 @@ the guest request an SE SoC reset, which resets the machine in place — MRAM
 (`/lfs`) survives, SRAM (including `__noinit`) is cleared like hardware, the
 firmware boots again and the bridge re-arms for the next client.
 
+The **control socket** (ticket 0031, `--ctl-port`, default `tcp://127.0.0.1:9562`)
+drives the device the way a tester drives hardware — one text verb per line,
+reply `ok [data]` / `err <reason>` (`nc 127.0.0.1 9562` for interactive use):
+`button down|up|click|hold <ms>` (the LPGPIO-1 button; 150 ms click → Lua
+`frame.button.single` ~400 ms after release, ≥1 s hold → `frame.button.long`;
+2/5/15 s holds hit the C-hardwired deep-sleep/pairing/ship-mode paths),
+`battery set 82%|4000mv|<raw>` and `battery?` (the firmware polls VBAT every
+10 s — allow one poll; `frame.battery_voltage()` is unfiltered,
+`frame.battery_level()` is EMA-filtered and lags), `charger on|off|?`
+(STAT gpio1.3; the vbat driver re-samples on the edge, so
+`frame.battery_charging()` follows immediately; `charger?` also reports the
+firmware's gpio0.6 charge-control output), `led?` (UTIMER3 PWM duty/period/
+enable), `reboot` (machine reset, MRAM preserved) and `wdt-fire` (inject a
+watchdog timeout: NMI → the firmware's NMI handler stores its `__noinit`
+magic → 200 ms later a TCM-preserving warm reset, after which the firmware's
+`halo_watchdog_has_fired()` cold-boot path reboots once more via the SE).
+In the QEMU window the `B` key presses/releases the button. Under QMP the
+same controls are `qom-get`/`qom-set` on `/machine` (`button-pressed`,
+`charger-connected`, `charge-enabled`, `battery-raw`, `led-duty`,
+`led-period`, `led-on`, `wdt-fire`).
+
 Tooling: `tools/repl_smoke.py` (end-to-end gate against a real image),
-`tools/run_emu_tests.py` (runs the unmodified device test-suite from a
-firmware checkout via `pyshim/brilliant_ble`, the phone-library shim).
+`tests/smoke_controls.py` (control-socket gate: button → Lua callbacks,
+battery/charger, wdt-fire), `tools/run_emu_tests.py` (runs the unmodified
+device test-suite from a firmware checkout via `pyshim/brilliant_ble`, the
+phone-library shim; exports `HALO_EMU_CTL` so tests can reach the control
+socket through `brilliant_ble.emu_control()`).
 Note: a firmware built without git metadata has an empty `frame.GIT_TAG`, and
 tests that `print(frame.GIT_TAG)` with `await_print` hang on any transport
 (hardware included) — `print("")` emits nothing. Build the image from a git

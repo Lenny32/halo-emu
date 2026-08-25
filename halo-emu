@@ -7,9 +7,39 @@ Usage:
              [--flash <mram.img>] [--flash-erase]
              [--headless] [--gdb]
              [--repl-port 9563] [--ble-port <raw port>]
+             [--ctl-port 9562]
              [--screenshot <png> [--screenshot-after <secs>]]
              [--mcuboot <mcuboot.bin>]
              [-- <extra qemu args>]
+
+The control socket (ticket 0031) serves tcp://127.0.0.1:9562 by default
+(--ctl-port, 0 disables): a line-oriented text protocol to drive the
+device the way a tester drives hardware.  One command per line, reply
+`ok [data]` or `err <reason>`:
+
+    button down|up          hold / release the hardware button
+    button click            press for 150 ms (a single click; the
+                            firmware reports it ~400 ms after release,
+                            once the double-click window expires)
+    button hold <ms>        press for <ms> (1000 = Lua long-press;
+                            2000 = deep sleep, 5000 = pairing window,
+                            15000 = ship mode — hardwired in C)
+    battery set <v>         82% | 4000mv | 3698 (raw 0..4095); the
+                            firmware polls every 10 s, so allow one
+                            poll before frame.battery_* reflects it
+    battery?                -> ok raw=.. mv=.. pct=..
+    charger on|off          charger STAT (gpio1.3)
+    charger?                -> ok connected=0|1 charge-enabled=0|1
+                            (charge-enabled = firmware's gpio0.6)
+    led?                    -> ok duty=.. period=.. on=0|1
+                            (UTIMER3 PWM: brightness = duty/period)
+    reboot                  full machine reset (MRAM/lfs preserved)
+    wdt-fire                inject a watchdog timeout: NMI, then a
+                            TCM-preserving warm reset 200 ms later
+    ping                    liveness check
+
+In the QEMU window the `B` key presses/releases the button.
+Interactive use: `nc 127.0.0.1 9562`.
 
 The Lua REPL bridge (ticket 0030) serves tcp://127.0.0.1:9563 by default:
 [u8 channel][u16 LE length][payload] frames, channel 0 = Lua RX/TX PDUs
@@ -68,6 +98,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zlib
 
@@ -158,6 +189,11 @@ def parse_args():
                    help="expose the raw BLE doorbell framing on this TCP "
                         "port instead of running the REPL bridge "
                         "(0 = off; used by tests/smoke_ble.py)")
+    p.add_argument("--ctl-port", type=int, default=9562, metavar="PORT",
+                   help="TCP port of the control socket (default 9562; "
+                        "0 disables it): button/battery/charger/led/"
+                        "reboot/wdt-fire verbs, one text command per "
+                        "line — see the module docstring")
     p.add_argument("--rom-stub", metavar="BIN", default=DEFAULT_ROM_STUB,
                    help="synthetic BLE/LC3 ROM stub image (default: "
                         "rom-stub/build/rom-stub-v1_2.bin if built; "
@@ -256,6 +292,233 @@ class Qmp:
             if "error" in resp:
                 raise RuntimeError(f"QMP {name}: {resp['error']['desc']}")
             # asynchronous event — skip
+
+
+# Discharge curve mV -> SoC % from the firmware's alif_vbat.c (a
+# constant-current discharge of a production unit); ascending in both,
+# linearly interpolated.  Used to translate `battery set 82%` into the
+# raw ADC value the firmware will convert back to ~82%.
+DISCHARGE_CURVE = [
+    (2920, 0), (3339, 5), (3415, 10), (3484, 15), (3531, 20),
+    (3563, 25), (3604, 30), (3630, 35), (3664, 40), (3705, 45),
+    (3753, 50), (3796, 55), (3849, 60), (3892, 65), (3939, 70),
+    (3995, 75), (4035, 80), (4072, 85), (4095, 90), (4112, 95),
+    (4128, 100),
+]
+
+
+def battery_pct_to_mv(pct):
+    pct = max(0, min(100, pct))
+    for (lo_mv, lo_pct), (hi_mv, hi_pct) in zip(DISCHARGE_CURVE,
+                                                DISCHARGE_CURVE[1:]):
+        if pct <= hi_pct:
+            return lo_mv + (hi_mv - lo_mv) * (pct - lo_pct) \
+                // (hi_pct - lo_pct)
+    return DISCHARGE_CURVE[-1][0]
+
+
+def battery_mv_to_pct(mv):
+    if mv <= DISCHARGE_CURVE[0][0]:
+        return 0
+    if mv >= DISCHARGE_CURVE[-1][0]:
+        return 100
+    for (lo_mv, lo_pct), (hi_mv, hi_pct) in zip(DISCHARGE_CURVE,
+                                                DISCHARGE_CURVE[1:]):
+        if mv < hi_mv:
+            span = hi_mv - lo_mv
+            return lo_pct + ((hi_pct - lo_pct) * (mv - lo_mv)
+                             + span // 2) // span
+    return 100
+
+
+# The vbat divider (2.4k/1k) against the 1.8 V ADC reference:
+# Vbat_mV = raw * 4320 / 4095 (alif_vbat.c, halo_adc.c)
+def battery_mv_to_raw(mv):
+    return max(0, min(4095, (mv * 4095 + 2160) // 4320))
+
+
+def battery_raw_to_mv(raw):
+    return raw * 4320 // 4095
+
+
+class CtlServer(threading.Thread):
+    """Control socket (ticket 0031): line-oriented text verbs on TCP,
+    translated to QMP qom-get/qom-set against the machine's runtime
+    control properties (and system_reset for `reboot`).  Timing verbs
+    (click, hold) sequence press/release host-side.  One client is
+    served at a time; commands within a connection are sequential."""
+
+    CLICK_MS = 150  # inside the 30 ms debounce .. 1000 ms long window
+
+    def __init__(self, qmp_path, listen_port, log=None):
+        super().__init__(daemon=True, name="halo-ctl")
+        self.qmp_path = qmp_path
+        self.listen_port = listen_port
+        self.log = log or (lambda msg: None)
+        self.qmp = None
+        self._stop = threading.Event()
+
+    # --- QMP plumbing -----------------------------------------------
+
+    def _qmp(self):
+        """The QMP connection, dialled lazily (QEMU may still be
+        starting) and re-dialled after errors."""
+        if self.qmp is None:
+            deadline = time.monotonic() + 15
+            while True:
+                try:
+                    self.qmp = Qmp(self.qmp_path)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.2)
+        return self.qmp
+
+    def _cmd(self, name, **arguments):
+        try:
+            return self._qmp().command(name, **arguments)
+        except (OSError, ConnectionError):
+            self.qmp = None  # dropped (e.g. QEMU restart): re-dial once
+            return self._qmp().command(name, **arguments)
+
+    def _get(self, prop):
+        return self._cmd("qom-get", path="/machine", property=prop)
+
+    def _set(self, prop, value):
+        self._cmd("qom-set", path="/machine", property=prop, value=value)
+
+    # --- verbs ------------------------------------------------------
+
+    def _verb_button(self, args):
+        if args == ["down"]:
+            self._set("button-pressed", True)
+        elif args == ["up"]:
+            self._set("button-pressed", False)
+        elif args == ["click"]:
+            return self._verb_button(["hold", str(self.CLICK_MS)])
+        elif len(args) == 2 and args[0] == "hold":
+            ms = int(args[1])
+            if not 0 < ms <= 60000:
+                return "err hold duration out of range (1..60000 ms)"
+            self._set("button-pressed", True)
+            time.sleep(ms / 1000.0)
+            self._set("button-pressed", False)
+        else:
+            return "err usage: button down|up|click|hold <ms>"
+        return "ok"
+
+    def _verb_battery(self, args):
+        if args == ["?"]:
+            raw = self._get("battery-raw")
+            mv = battery_raw_to_mv(raw)
+            return f"ok raw={raw} mv={mv} pct={battery_mv_to_pct(mv)}"
+        if len(args) == 2 and args[0] == "set":
+            v = args[1].lower()
+            if v.endswith("%"):
+                raw = battery_mv_to_raw(battery_pct_to_mv(int(v[:-1])))
+            elif v.endswith("mv"):
+                raw = battery_mv_to_raw(int(v[:-2]))
+            else:
+                raw = int(v)
+            if not 0 <= raw <= 4095:
+                return "err raw value out of range (0..4095)"
+            self._set("battery-raw", raw)
+            mv = battery_raw_to_mv(raw)
+            return f"ok raw={raw} mv={mv} pct={battery_mv_to_pct(mv)}"
+        return "err usage: battery set <pct%|mV mv|raw> | battery?"
+
+    def _verb_charger(self, args):
+        if args == ["?"]:
+            conn = int(self._get("charger-connected"))
+            en = int(self._get("charge-enabled"))
+            return f"ok connected={conn} charge-enabled={en}"
+        if args in (["on"], ["off"]):
+            self._set("charger-connected", args == ["on"])
+            return "ok"
+        return "err usage: charger on|off|?"
+
+    def _verb_led(self, args):
+        duty = self._get("led-duty")
+        period = self._get("led-period")
+        on = int(self._get("led-on"))
+        return f"ok duty={duty} period={period} on={on}"
+
+    def dispatch(self, line):
+        parts = line.split()
+        if not parts:
+            return None
+        verb, args = parts[0], parts[1:]
+        # `led?` / `battery?` / `charger?` read naturally without space
+        if verb.endswith("?") and len(verb) > 1:
+            verb, args = verb[:-1], ["?"] + args
+        try:
+            if verb == "button":
+                return self._verb_button(args)
+            if verb == "battery":
+                return self._verb_battery(args)
+            if verb == "charger":
+                return self._verb_charger(args)
+            if verb == "led" and args == ["?"]:
+                return self._verb_led(args)
+            if verb == "reboot" and not args:
+                self._cmd("system_reset")
+                return "ok"
+            if verb == "wdt-fire" and not args:
+                self._set("wdt-fire", True)
+                return "ok"
+            if verb == "ping" and not args:
+                return "ok"
+            return f"err unknown command: {line.strip()}"
+        except ValueError:
+            return "err bad number"
+        except (OSError, ConnectionError, RuntimeError) as e:
+            return f"err {e}"
+
+    # --- server loop ------------------------------------------------
+
+    def _serve_client(self, sock):
+        sock.settimeout(1.0)
+        buf = b""
+        with sock:
+            while not self._stop.is_set():
+                try:
+                    data = sock.recv(4096)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                if not data:
+                    return
+                buf += data
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    reply = self.dispatch(line.decode(errors="replace"))
+                    if reply is not None:
+                        try:
+                            sock.sendall(reply.encode() + b"\n")
+                        except OSError:
+                            return
+
+    def run(self):
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", self.listen_port))
+        srv.listen(1)
+        srv.settimeout(0.5)
+        self.log(f"control socket on tcp://127.0.0.1:{self.listen_port}")
+        with srv:
+            while not self._stop.is_set():
+                try:
+                    sock, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                self._serve_client(sock)
+
+    def stop(self):
+        self._stop.set()
 
 
 def ppm_to_png(ppm_data, out_path):
@@ -386,6 +649,17 @@ def main():
               f"tcp://127.0.0.1:{args.repl_port}", file=sys.stderr)
     else:
         cmd += ["-serial", "null"]
+    # Control socket (ticket 0031): a QMP monitor on a private unix
+    # socket, driven by the CtlServer's text verbs on TCP.
+    ctl = None
+    ctl_dir = None
+    if args.ctl_port:
+        ctl_dir = tempfile.mkdtemp(prefix="halo-emu-ctl-")
+        cmd += ["-qmp", f"unix:{os.path.join(ctl_dir, 'qmp.sock')},"
+                        "server=on,wait=off"]
+        ctl = CtlServer(os.path.join(ctl_dir, "qmp.sock"), args.ctl_port,
+                        log=lambda m: print(f"halo-emu: {m}",
+                                            file=sys.stderr))
     # CDC200 display window (ticket 0029): SDL unless --headless.
     cmd += ["-display", "none" if args.headless else "sdl"]
     if args.gdb:
@@ -396,17 +670,19 @@ def main():
 
     if bridge:
         bridge.start()
+    if ctl:
+        ctl.start()
 
     try:
         if args.screenshot:
             run_screenshot(cmd, args)
             return
 
-        if bridge is None:
+        if bridge is None and ctl is None:
             os.execv(QEMU, cmd)
 
-        # The bridge lives in this process, so keep it alive alongside
-        # QEMU instead of exec'ing over it.
+        # The bridge/control server live in this process, so keep it
+        # alive alongside QEMU instead of exec'ing over it.
         proc = subprocess.Popen(cmd)
         while True:
             try:
@@ -416,10 +692,13 @@ def main():
     finally:
         if bridge:
             bridge.stop()
-        if bridge_dir:
-            for f in os.listdir(bridge_dir):
-                os.unlink(os.path.join(bridge_dir, f))
-            os.rmdir(bridge_dir)
+        if ctl:
+            ctl.stop()
+        for d in (bridge_dir, ctl_dir):
+            if d:
+                for f in os.listdir(d):
+                    os.unlink(os.path.join(d, f))
+                os.rmdir(d)
 
 
 if __name__ == "__main__":

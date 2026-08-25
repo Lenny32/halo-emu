@@ -10,8 +10,11 @@
  * status except GLB_CNTR_RUNNING, and never polls — so the timer block
  * is plain register storage (every RMW readback is satisfied), and the
  * global block derives RUNNING from the START/STOP write-1 registers.
- * Duty-cycle readout for the LED-state ticket: COMPARE_A / CNTR_PTR
- * with COMPARE_CTRL_A bits 8/9 deciding on/idle-level.
+ *
+ * LED readout (ticket 0031): read-only QOM properties "led-duty"
+ * (COMPARE_A), "led-period" (CNTR_PTR) and "led-on" (COMPARE_CTRL_A
+ * bit 8, DRIVER_EN) — the machine forwards them for the control
+ * socket's `led?` verb.  Brightness = duty/period while led-on.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -35,6 +38,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(HaloUtimerState, HALO_UTIMER)
 #define R_GLB_DRIVER_OEN   0x10 /* active-low output enable, plain R/W */
 #define R_GLB_CLOCK_ENABLE 0x20 /* plain R/W */
 #define GLB_BLOCK_SIZE     0x24
+
+/* Timer-block registers the LED PWM readout uses */
+#define R_CNTR_PTR         0xA4 /* PWM period */
+#define R_COMPARE_CTRL_A   0x8C /* bit 8 = DRIVER_EN, bit 9 = idle-high */
+#define R_COMPARE_A        0xD0 /* PWM duty */
+#define COMPARE_CTRL_DRIVER_EN (1 << 8)
 
 struct HaloUtimerState {
     SysBusDevice parent_obj;
@@ -129,6 +138,13 @@ static void halo_utimer_reset(DeviceState *dev)
     s->glb_clock_enable = 0;
 }
 
+static bool halo_utimer_get_led_on(Object *obj, Error **errp)
+{
+    HaloUtimerState *s = HALO_UTIMER(obj);
+
+    return (s->regs[R_COMPARE_CTRL_A / 4] & COMPARE_CTRL_DRIVER_EN) != 0;
+}
+
 static void halo_utimer_init(Object *obj)
 {
     HaloUtimerState *s = HALO_UTIMER(obj);
@@ -140,6 +156,14 @@ static void halo_utimer_init(Object *obj)
     memory_region_init_io(&s->glb_iomem, obj, &halo_utimer_glb_ops, s,
                           "halo-utimer.global", GLB_BLOCK_SIZE);
     sysbus_init_mmio(sbd, &s->glb_iomem);
+
+    object_property_add_uint32_ptr(obj, "led-duty",
+                                   &s->regs[R_COMPARE_A / 4],
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint32_ptr(obj, "led-period",
+                                   &s->regs[R_CNTR_PTR / 4],
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_bool(obj, "led-on", halo_utimer_get_led_on, NULL);
 }
 
 static void halo_utimer_class_init(ObjectClass *klass, const void *data)
