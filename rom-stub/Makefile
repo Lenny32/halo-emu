@@ -47,6 +47,16 @@ CFLAGS := $(ARCHFLAGS) -Os -g -ffreestanding -fno-builtin \
 	-Ivendor/include/common \
 	-Ivendor/include/ip/hl \
 	-Ivendor/include/ip/ahi \
+	-Ivendor/include/ip/gaf \
+	-Ivendor/include/ip/gaf/bap \
+	-Ivendor/include/ip/gaf/bap/uc \
+	-Ivendor/include/ip/gaf/bap/capa \
+	-Ivendor/include/ip/gaf/cap \
+	-Ivendor/include/ip/gaf/tmap \
+	-Ivendor/include/ip/gaf/arc \
+	-Ivendor/include/ip/gaf/arc/aic \
+	-Ivendor/include/ip/gaf/arc/mic \
+	-Ivendor/include/ip/gaf/arc/vc \
 	-Ivendor/include/ipc \
 	-Ivendor/include/isooshm \
 	-Ivendor/include/ke \
@@ -57,7 +67,18 @@ CFLAGS := $(ARCHFLAGS) -Os -g -ffreestanding -fno-builtin \
 # use its float builtins (that turns fabsf/sqrtf/floorf/... into single
 # FPU instructions, so no libm is needed — only libgcc's 64-bit divide
 # is left over).
+#
+# LC3_PLUS/LC3_PLUS_HR are liblc3 defaults (=1) and size every work buffer
+# for 96 kHz frames (LC3_MAX_SRATE_HZ, tables.h:68-70).  The firmware only
+# ever asks for standard LC3 at 8-48 kHz -- BAP advertises at most 48 kHz
+# (ble_audio.c source_capas) and the proprietary path runs at 16 kHz -- and
+# the oversized buffers are pure stack: lc3_decode() then overflowed the
+# 3072-byte ble_audio_dec thread (CONFIG_LC3_DECODER_STACK_SIZE) and halted
+# the guest with "ZEPHYR FATAL ERROR 2: Stack overflow" on the first
+# received SDU.  Building for the profile the firmware actually uses keeps
+# the decode inside the stack budget the firmware sizes for the real ROM.
 LC3_CFLAGS := $(ARCHFLAGS) -Os -g -fno-math-errno \
+	-DLC3_PLUS=0 -DLC3_PLUS_HR=0 \
 	-ffunction-sections -fdata-sections \
 	-I$(LC3_SRC)/include -I$(LC3_SRC)/src
 

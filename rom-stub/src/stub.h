@@ -169,4 +169,12 @@ void stub_conn_run_pairing_if_needed(void);
 void stub_gatt_host_write(uint16_t hdl, const uint8_t *data, uint16_t len);
 void stub_gatt_host_read(uint16_t hdl);
 
+/* stub_iso.c — isochronous data path (ticket 0039) */
+void stub_iso_host_sdu(const uint8_t *p_data, uint16_t len);
+
+/* stub_ase.c — LE Audio ASE state machine (ticket 0038) */
+void stub_ase_host_op(uint8_t op, const uint8_t *p_data, uint16_t len);
+bool stub_ase_is_streaming(uint8_t ase_lid);
+uint8_t stub_ase_state(uint8_t ase_lid);
+
 #endif /* ROM_STUB_H_ */

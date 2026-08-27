@@ -60,6 +60,21 @@ device the way a tester drives hardware.  One command per line, reply
     tap [single|double|triple]
                             fire an IMU tap on INT1 (gpio3.2), the
                             trigger the Lua imu tap callbacks use
+    ase codec|qos|enable|start|disable|release <lid>
+                            drive the LE Audio ASE state machine as a
+                            central would (ticket 0038): codec -> qos ->
+                            enable -> start walks an ASE to streaming.
+                            No HCI exists, so this stands in for the ASE
+                            Control Point writes; the firmware's own
+                            request/confirm callbacks do run
+    ase dp <lid> [off]      gate the isochronous datapath (0039 carries
+                            the audio itself)
+    ase? [lid]              -> ok ase0=idle|codec-configured|...
+    iso?                    -> ok sdus=.. bytes=.. last=..  (LC3 SDUs the
+                            guest has sent on a source stream)
+    iso replay [n]          feed captured SDUs back into the sink
+                            datapath, one per 10 ms SDU interval
+    iso clear               drop the capture
     reboot                  full machine reset (MRAM/lfs preserved)
     wdt-fire                inject a watchdog timeout: NMI, then a
                             TCM-preserving warm reset 200 ms later
@@ -402,12 +417,16 @@ class CtlServer(threading.Thread):
 
     CLICK_MS = 150  # inside the 30 ms debounce .. 1000 ms long window
 
-    def __init__(self, qmp_path, listen_port, log=None):
+    def __init__(self, qmp_path, listen_port, log=None, bridge=None):
         super().__init__(daemon=True, name="halo-ctl")
         self.qmp_path = qmp_path
         self.listen_port = listen_port
         self.log = log or (lambda msg: None)
         self.qmp = None
+        # The REPL bridge, when one is running: the `ase` verbs go to it
+        # rather than to QMP, because the LE Audio state machine lives in
+        # the ROM stub and is driven over the doorbell (ticket 0038).
+        self.bridge = bridge
         self._stop = threading.Event()
 
     # --- QMP plumbing -----------------------------------------------
@@ -576,6 +595,68 @@ class CtlServer(threading.Thread):
             return "ok"
         return "err usage: tap [single|double|triple]"
 
+    def _verb_ase(self, args):
+        """Drive the BAP unicast server's ASE state machine (0038)."""
+        if self.bridge is None:
+            return "err no REPL bridge (LE Audio needs the doorbell)"
+        import ble_bridge as bb
+
+        if args and args[0] == "?":
+            lids = [int(args[1])] if len(args) == 2 else [0, 1, 2]
+            parts = " ".join(
+                "ase%d=%s" % (lid, bb.ASE_STATE_NAMES.get(
+                    self.bridge.ase_state(lid), "?"))
+                for lid in lids)
+            return f"ok {parts}"
+
+        if len(args) < 2:
+            return ("err usage: ase codec|qos|enable|start|disable|release "
+                    "<ase_lid> | ase dp <ase_lid> [off] | ase? [lid]")
+        verb, lid = args[0], int(args[1])
+        if verb == "codec":
+            self.bridge.ase_configure_codec(lid)
+        elif verb == "qos":
+            self.bridge.ase_configure_qos(lid)
+        elif verb == "enable":
+            self.bridge.ase_enable(lid)
+        elif verb == "start":
+            self.bridge.ase_start(lid)
+        elif verb == "disable":
+            self.bridge.ase_disable(lid)
+        elif verb == "release":
+            self.bridge.ase_release(lid)
+        elif verb == "dp":
+            self.bridge.ase_datapath(lid, args[2:] != ["off"])
+        else:
+            return f"err unknown ase verb: {verb}"
+        return "ok"
+
+    def _verb_iso(self, args):
+        """Isochronous SDUs (ticket 0039): what the guest has sent, and
+        replaying them back into its sink datapath."""
+        if self.bridge is None:
+            return "err no REPL bridge (LE Audio needs the doorbell)"
+
+        if args and args[0] == "?":
+            sdus = self.bridge.iso_captured()
+            total = sum(len(s) for s in sdus)
+            last = len(sdus[-1]) if sdus else 0
+            return f"ok sdus={len(sdus)} bytes={total} last={last}"
+        if args == ["clear"]:
+            self.bridge.iso_clear()
+            return "ok"
+        if args and args[0] == "replay":
+            sdus = self.bridge.iso_captured()
+            if len(args) == 2:
+                sdus = sdus[:int(args[1])]
+            for seq, sdu in enumerate(sdus):
+                self.bridge.iso_send_sdu(sdu, seq=seq)
+                # One SDU per interval: the guest posts a single buffer at
+                # a time, so bursting would drop all but the first.
+                time.sleep(0.01)
+            return f"ok replayed={len(sdus)}"
+        return "err usage: iso? | iso clear | iso replay [n]"
+
     def _verb_speaker(self, args):
         en = int(self._get("speaker-enabled"))
         playing = int(self._get("speaker-playing"))
@@ -617,6 +698,10 @@ class CtlServer(threading.Thread):
                 return self._verb_magn(args)
             if verb == "tap":
                 return self._verb_tap(args)
+            if verb == "ase":
+                return self._verb_ase(args)
+            if verb == "iso":
+                return self._verb_iso(args)
             if verb == "reboot" and not args:
                 self._cmd("system_reset")
                 return "ok"
@@ -889,7 +974,8 @@ def main():
                         "server=on,wait=off"]
         ctl = CtlServer(os.path.join(ctl_dir, "qmp.sock"), args.ctl_port,
                         log=lambda m: print(f"halo-emu: {m}",
-                                            file=sys.stderr))
+                                            file=sys.stderr),
+                        bridge=bridge)
     # CDC200 display window (ticket 0029): SDL unless --headless.
     cmd += ["-display", "none" if args.headless else "sdl"]
     if args.gdb:

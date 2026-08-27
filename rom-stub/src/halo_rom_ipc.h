@@ -58,6 +58,21 @@
 #define HALO_BLE_OP_GATT_WRITE 0x03u  /* u16 hdl, u8 data[] */
 #define HALO_BLE_OP_GATT_READ 0x04u   /* u16 hdl */
 
+/* LE Audio: the fabricated central driving the ASE state machine
+ * (ticket 0038).  There is no HCI here, so these stand in for the ASE
+ * Control Point writes a real central would make. */
+#define HALO_BLE_OP_ASE_CODEC 0x05u   /* u8 ase_lid, con_lid, tgt_latency,
+                                       * tgt_phy, sampling_freq, frame_dur,
+                                       * u16 frame_octet */
+#define HALO_BLE_OP_ASE_QOS 0x06u     /* u8 ase_lid, u8 stream_lid */
+#define HALO_BLE_OP_ASE_ENABLE 0x07u  /* u8 ase_lid */
+#define HALO_BLE_OP_ASE_START 0x08u   /* u8 ase_lid (CIS established) */
+#define HALO_BLE_OP_ASE_DISABLE 0x09u /* u8 ase_lid */
+#define HALO_BLE_OP_ASE_RELEASE 0x0Au /* u8 ase_lid */
+#define HALO_BLE_OP_ASE_DP 0x0Bu      /* u8 ase_lid, u8 start */
+#define HALO_BLE_OP_ISO_SDU 0x0Cu     /* u8 stream_lid, u8 rfu, u16 seq,
+                                       * u8 lc3[] (ticket 0039) */
+
 /* Frame opcodes: guest -> host */
 #define HALO_BLE_EVT_NOTIFY 0x81u     /* u16 hdl, u8 evt_type, u8 data[] */
 #define HALO_BLE_EVT_SVC 0x82u        /* u16 start_hdl, u8 nb_att, u8 uuid[16] */
@@ -69,6 +84,9 @@
 #define HALO_BLE_EVT_PAIRED 0x88u     /* u8 conidx */
 #define HALO_BLE_EVT_ADV_STATE 0x89u  /* u8 actv_idx, u8 state (see below) */
 #define HALO_BLE_EVT_ADV_DATA 0x8Au   /* u8 actv_idx, u8 kind, u8 data[] */
+#define HALO_BLE_EVT_ASE_STATE 0x8Bu  /* u8 ase_lid, u8 con_lid, u8 state */
+#define HALO_BLE_EVT_ISO_SDU 0x8Cu    /* u8 stream_lid, u8 rfu, u16 seq,
+                                       * u8 lc3[] (ticket 0039) */
 
 #define HALO_BLE_ADV_CREATED 0u
 #define HALO_BLE_ADV_STARTED 1u

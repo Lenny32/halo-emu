@@ -56,12 +56,54 @@ MTU = 512  # usable ATT payload; frame.bluetooth.max_length() == MTU - 1
 OP_CONNECT = 0x01
 OP_DISCONNECT = 0x02
 OP_GATT_WRITE = 0x03
+# LE Audio: the fabricated central driving the ASE state machine
+# (ticket 0038). There is no HCI in the emulator, so these stand in for
+# the ASE Control Point writes a real central would make.
+OP_ASE_CODEC = 0x05
+OP_ASE_QOS = 0x06
+OP_ASE_ENABLE = 0x07
+OP_ASE_START = 0x08
+OP_ASE_DISABLE = 0x09
+OP_ASE_RELEASE = 0x0A
+OP_ASE_DP = 0x0B
+OP_ISO_SDU = 0x0C
 EVT_NOTIFY = 0x81
 EVT_SVC = 0x82
 EVT_ATT = 0x83
 EVT_CONNECTED = 0x84
 EVT_DISCONNECTED = 0x85
 EVT_PAIRED = 0x88
+EVT_ASE_STATE = 0x8B
+EVT_ISO_SDU = 0x8C
+
+# bap_uc_ase_state (bap_uc.h:124-141)
+ASE_STATE_IDLE = 0
+ASE_STATE_CODEC_CONFIGURED = 1
+ASE_STATE_QOS_CONFIGURED = 2
+ASE_STATE_ENABLING = 3
+ASE_STATE_STREAMING = 4
+ASE_STATE_DISABLING = 5
+ASE_STATE_RELEASING = 6
+ASE_STATE_NAMES = {
+    ASE_STATE_IDLE: "idle",
+    ASE_STATE_CODEC_CONFIGURED: "codec-configured",
+    ASE_STATE_QOS_CONFIGURED: "qos-configured",
+    ASE_STATE_ENABLING: "enabling",
+    ASE_STATE_STREAMING: "streaming",
+    ASE_STATE_DISABLING: "disabling",
+    ASE_STATE_RELEASING: "releasing",
+}
+
+# BAP 16_2: 16 kHz, 10 ms, 40 octets — the one configuration the
+# firmware advertises for both directions (ble_audio.c sink_capas /
+# source_capas), so anything else is refused by frame_octet_within_capa.
+BAP_SAMPLING_FREQ_16000HZ = 3
+BAP_FRAME_DUR_10MS = 1
+BAP_FRAME_OCTET_16_2 = 40
+
+# Cap on captured SDUs: a 10 ms stream produces 100 per second and they
+# are only drained when something asks for them.
+ISO_RX_MAX = 2000
 
 # Lua service 7A230001-5475-A6A4-654C-8431F6AD49C4, little-endian as
 # dumped by the ROM stub; byte 12 is the characteristic id (01=svc,
@@ -112,6 +154,8 @@ class ReplBridge(threading.Thread):
         self._client = None
         self._atts = {}          # hdl -> uuid bytes
         self._svc_hdls = set()   # service start handles seen this boot
+        self._ase_state = {}     # ase_lid -> bap_uc_ase_state (0038)
+        self._iso_rx = []        # captured LC3 SDUs from the guest (0039)
         self._handles = None     # dict once the Lua service is resolved
         self._db_ready = threading.Event()
         self._connected_evt = threading.Event()
@@ -147,6 +191,58 @@ class ReplBridge(threading.Thread):
     def _gatt_write(self, hdl, data):
         self._doorbell_send(OP_GATT_WRITE, struct.pack("<H", hdl) + data)
 
+    # --- LE Audio: drive the ASE state machine (ticket 0038) --------
+
+    def ase_state(self, ase_lid):
+        """Last state reported for an ASE, or IDLE if never seen."""
+        with self._state_lock:
+            return self._ase_state.get(ase_lid, ASE_STATE_IDLE)
+
+    def ase_configure_codec(self, ase_lid, con_lid=0, tgt_latency=1,
+                            tgt_phy=1,
+                            sampling_freq=BAP_SAMPLING_FREQ_16000HZ,
+                            frame_dur=BAP_FRAME_DUR_10MS,
+                            frame_octet=BAP_FRAME_OCTET_16_2):
+        self._doorbell_send(OP_ASE_CODEC, struct.pack(
+            "<BBBBBBH", ase_lid, con_lid, tgt_latency, tgt_phy,
+            sampling_freq, frame_dur, frame_octet))
+
+    def ase_configure_qos(self, ase_lid, stream_lid=0):
+        self._doorbell_send(OP_ASE_QOS,
+                            struct.pack("<BB", ase_lid, stream_lid))
+
+    def ase_enable(self, ase_lid):
+        self._doorbell_send(OP_ASE_ENABLE, struct.pack("<B", ase_lid))
+
+    def ase_start(self, ase_lid):
+        self._doorbell_send(OP_ASE_START, struct.pack("<B", ase_lid))
+
+    def ase_disable(self, ase_lid):
+        self._doorbell_send(OP_ASE_DISABLE, struct.pack("<B", ase_lid))
+
+    def ase_release(self, ase_lid):
+        self._doorbell_send(OP_ASE_RELEASE, struct.pack("<B", ase_lid))
+
+    def ase_datapath(self, ase_lid, start=True):
+        self._doorbell_send(OP_ASE_DP,
+                            struct.pack("<BB", ase_lid, 1 if start else 0))
+
+    # --- LE Audio: isochronous SDUs (ticket 0039) -------------------
+
+    def iso_send_sdu(self, data, stream_lid=0, seq=0):
+        """Inject one LC3 SDU towards the guest's sink datapath."""
+        self._doorbell_send(OP_ISO_SDU, struct.pack(
+            "<BBH", stream_lid, 0, seq & 0xFFFF) + bytes(data))
+
+    def iso_captured(self):
+        """LC3 SDUs the guest has sent (source direction), oldest first."""
+        with self._state_lock:
+            return list(self._iso_rx)
+
+    def iso_clear(self):
+        with self._state_lock:
+            self._iso_rx.clear()
+
     def _resolve_handles(self):
         """Find the Lua service characteristic value handles and the CCCs
         that immediately follow the notify characteristics."""
@@ -177,6 +273,8 @@ class ReplBridge(threading.Thread):
         with self._state_lock:
             self._atts.clear()
             self._svc_hdls.clear()
+            self._ase_state.clear()
+            self._iso_rx.clear()
             self._handles = None
             self._db_ready.clear()
             self._connected_evt.clear()
@@ -219,6 +317,22 @@ class ReplBridge(threading.Thread):
                 # re-registers the services at fresh handles, and the
                 # highest (latest) registration must win.
                 self._resolve_handles()
+            return
+        if op == EVT_ASE_STATE:
+            if len(payload) >= 3:
+                ase_lid, con_lid, state = payload[0], payload[1], payload[2]
+                with self._state_lock:
+                    self._ase_state[ase_lid] = state
+                self.log(f"ASE {ase_lid} -> "
+                         f"{ASE_STATE_NAMES.get(state, state)}")
+            return
+        if op == EVT_ISO_SDU:
+            if len(payload) >= 4:
+                with self._state_lock:
+                    # Bounded: a streaming source produces 100 SDUs/s and
+                    # nothing here consumes them unless a test asks.
+                    if len(self._iso_rx) < ISO_RX_MAX:
+                        self._iso_rx.append(bytes(payload[4:]))
             return
         if op == EVT_CONNECTED:
             self._connected_evt.set()

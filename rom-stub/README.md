@@ -11,7 +11,7 @@ surface the firmware actually uses.
 
 Derived by intersecting the symbol maps with the identifiers referenced by
 the firmware sources (`modules/halo/src/ble_*.c`, `modules/hal/alif/ble/plf/`)
-— 79 entry points, three tiers:
+— 80 entry points, two tiers:
 
 - **Semantic** — GAPM configuration + advertising chain, single-connection
   GAPC with a deterministic Just-Works pairing emulation, GATT server
@@ -19,10 +19,13 @@ the firmware sources (`modules/halo/src/ble_*.c`, `modules/hal/alif/ble/plf/`)
   (ANCS discovery completes "not found"), `co_buf` pool, `co_rand_word`.
   Procedures complete synchronously (completion callbacks run inside the
   call — the firmware's counting semaphores tolerate that).
-- **Declared-unsupported** — LE Audio (BAP/CAP/TMAP/ARC), isochronous data
-  path, LC3 codec: clean error returns; `halo_ble_audio_init()` aborts and
-  ble_manager logs a warning and continues.  Audio is ticket 0032.
-- **Trap thunks** — every other pinned symbol (914) branches to a thunk
+  Since 0032/0038/0039 this also covers the whole audio surface: the LC3
+  codec (`stub_lc3.c`, liblc3), the GAF profile layer — BAP unicast and
+  capabilities servers, CAP, TMAP, ARC (`stub_gaf.c`) — the ASE state
+  machine (`stub_ase.c`) and the isochronous data path (`stub_iso.c`).
+  The "declared-unsupported" tier this file used to describe is gone, and
+  `stub_misc.c` with it.
+- **Trap thunks** — every other pinned symbol (913) branches to a thunk
   that reports symbol index + caller LR to the QEMU doorbell device (logged
   by name via the generated `.syms` table) and returns
   `GAP_ERR_NOT_SUPPORTED`: a missed dependency is loud, never silent.

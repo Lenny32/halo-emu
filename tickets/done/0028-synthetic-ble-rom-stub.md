@@ -4,6 +4,11 @@
 **Depends on:** 0027
 **Effort:** XL — the risk item of the queue
 
+> **Superseded in part (2026-08-26):** the "declared-unsupported" tier this ticket
+> defined for LE Audio is implemented by tickets 0038 (GAF profile layer + ASE state
+> machine) and 0039 (isochronous data path). The `Error 255` / `Failed to initialize
+> LE Audio service` pair recorded here as an accepted outcome no longer appears.
+
 ## Story
 
 The firmware's BLE host stack lives in on-chip ROM: the app links against **983 absolute

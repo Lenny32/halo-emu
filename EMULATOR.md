@@ -164,6 +164,18 @@ mcuboot (`0x80000000`) is optional to emulate; the app boots standalone.
    ROM called via pinned addresses (`modules/hal/alif/ble/v1_2/rom_symbols_ble.lds`);
    controller = ES0 RISC-V core reached by HCI-H4 over `uart_hci` `0x4300A000` (IRQ 50,
    3 Mbaud). The synthetic ROM stub bypasses HCI/ES0 entirely.
+7. **LE Audio** (modeled, 0038/0039): the GAF profile layer — BAP unicast server + PACS,
+   CAP, TMAP, ARC volume/mic/AICS — is implemented in the ROM stub (`stub_gaf.c`), with
+   the ASE state machine in `stub_ase.c` and the isochronous data path in `stub_iso.c`.
+   Because there is no HCI and no link layer, **the central is fabricated host-side**:
+   `HALO_BLE_OP_ASE_*` frames from `tools/ble_bridge.py` stand in for ASE Control Point
+   writes, and LC3 SDUs cross the doorbell (`OP_ISO_SDU` in, `EVT_ISO_SDU` out). The
+   firmware's half is real — its `*_req` callbacks run and its `*_cfm()` answers drive the
+   transitions, so a refusal stops a transition exactly as on hardware. Drive it with the
+   `ase` / `iso` control-socket verbs. **liblc3 must be built `-DLC3_PLUS=0
+   -DLC3_PLUS_HR=0`**: the defaults size every work buffer for 96 kHz frames, and the
+   resulting stack use overflows the firmware's 3072-byte `ble_audio_dec` thread
+   (`CONFIG_LC3_DECODER_STACK_SIZE`) on the first decoded SDU.
 
 ## Console
 

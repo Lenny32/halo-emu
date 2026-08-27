@@ -225,6 +225,20 @@ void hstub_rwip_process(void)
                     (uint16_t)(payload[0] | (payload[1] << 8)));
             }
             break;
+        case HALO_BLE_OP_ASE_CODEC:
+        case HALO_BLE_OP_ASE_QOS:
+        case HALO_BLE_OP_ASE_ENABLE:
+        case HALO_BLE_OP_ASE_START:
+        case HALO_BLE_OP_ASE_DISABLE:
+        case HALO_BLE_OP_ASE_RELEASE:
+        case HALO_BLE_OP_ASE_DP:
+            /* LE Audio: the fabricated central (ticket 0038) */
+            stub_ase_host_op(op, payload, len);
+            break;
+        case HALO_BLE_OP_ISO_SDU:
+            /* One isochronous SDU from the host (ticket 0039) */
+            stub_iso_host_sdu(payload, len);
+            break;
         default:
             break;
         }
