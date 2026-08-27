@@ -80,4 +80,7 @@ register file returns 0 for anything unwritten:
 ## Follow-up
 
 The PAG7982 camera @`0x40` on I2C1 is still unattached and its DT node is **not**
-lazy-init — that stays with ticket 0033.
+lazy-init — that stays with ticket 0033. **Done there (2026-08-27):** the sensor is a
+bank-switched register file (`halo_pag7982.c`) and the LPCAM controller feeds it frames
+(`halo_lpcam.c`). Binding at boot turned out to be harmless — the driver defers every I2C
+transfer to its PM resume, which only the Lua camera service triggers.

@@ -46,6 +46,18 @@ device the way a tester drives hardware.  One command per line, reply
     speaker?                -> ok enabled=0|1 playing=0|1 rate=..
                                samples=..  (enabled = MAX98357A
                                SD_MODE on gpio8.5)
+    camera <src>|none       set the camera frame source at runtime:
+                            test-pattern, a png/pnm/jpeg/mjpeg file, or
+                            none for the LPCAM model's built-in gradient.
+                            The camera is asleep until Lua calls
+                            frame.camera.power_save(false)
+    camera?                 -> ok source=file|gradient frames=.. frame=..
+                            captures=.. size=WxH streaming=0|1
+                            triggers=..  (captures counts DMA'd frames —
+                            one Lua capture is 3, LUA_CAMERA_SKIP_FRAMES;
+                            triggers counts how often the firmware has
+                            started the PAG7982 over I2C, streaming is
+                            whether it is running right now)
     accel <x> <y> <z>       set the IMU sample in milli-g, device axes;
                             range is 2 g, so |value| <= 2000. The Lua
                             direction() remaps device->host as up = X,
@@ -266,6 +278,20 @@ def parse_args():
                         "type (default sdl; try pa or alsa) for speaker "
                         "playback and microphone capture. Off by default, "
                         "so CI and --headless runs stay silent")
+    p.add_argument("--camera", metavar="SRC",
+                   help="feed the camera from this source: 'test-pattern' "
+                        "or a png/pnm/pgm/ppm/jpeg/mjpeg file, scaled to "
+                        "whatever the firmware asks for. Without it the "
+                        "LPCAM model serves a built-in gradient, so "
+                        "frame.camera still works")
+    p.add_argument("--camera-max-frames", type=int, default=30,
+                   metavar="N",
+                   help="frames to take from a multi-frame source "
+                        "(MJPEG); default 30. Decoding is pure Python, "
+                        "roughly 0.5 s per VGA frame")
+    p.add_argument("--camera-fps", type=float, default=0.0, metavar="FPS",
+                   help="pace camera frames at this rate instead of the "
+                        "sensor's nominal 30 fps (0 = sensor rate)")
     p.add_argument("--mcuboot", metavar="BIN",
                    help="chain-boot spike: load this mcuboot at MRAM 0 "
                         "and vector from 0x80000000")
@@ -417,12 +443,16 @@ class CtlServer(threading.Thread):
 
     CLICK_MS = 150  # inside the 30 ms debounce .. 1000 ms long window
 
-    def __init__(self, qmp_path, listen_port, log=None, bridge=None):
+    def __init__(self, qmp_path, listen_port, log=None, bridge=None,
+                 cam_dir=None):
         super().__init__(daemon=True, name="halo-ctl")
         self.qmp_path = qmp_path
         self.listen_port = listen_port
         self.log = log or (lambda msg: None)
         self.qmp = None
+        # Scratch directory for camera frame containers the `camera`
+        # verb builds at runtime (ticket 0033).
+        self.cam_dir = cam_dir
         # The REPL bridge, when one is running: the `ase` verbs go to it
         # rather than to QMP, because the LE Audio state machine lives in
         # the ROM stub and is driven over the doorbell (ticket 0038).
@@ -595,6 +625,38 @@ class CtlServer(threading.Thread):
             return "ok"
         return "err usage: tap [single|double|triple]"
 
+    def _verb_camera(self, args):
+        """Camera frame source and readouts (ticket 0033)."""
+        if args == ["?"]:
+            source = self._get("camera-source")
+            return ("ok source=%s frames=%s frame=%s captures=%s "
+                    "size=%sx%s streaming=%d triggers=%s"
+                    % (source, self._get("camera-frames"),
+                       self._get("camera-frame"),
+                       self._get("camera-captures"),
+                       self._get("camera-width"),
+                       self._get("camera-height"),
+                       int(self._get("camera-streaming")),
+                       self._get("camera-triggers")))
+        if len(args) == 1 and args[0] in ("none", "off", "gradient"):
+            self._set("camera-file", "")
+            return "ok"
+        if len(args) == 1:
+            if not self.cam_dir:
+                return "err no scratch directory for camera frames"
+            import camera_source
+
+            out = os.path.join(self.cam_dir, "runtime.cam")
+            try:
+                w, h, frames = camera_source.build_container(args[0], out)
+            except camera_source.CameraSourceError as e:
+                return f"err {e}"
+            # The model re-reads the file on every set, so reusing the
+            # same path is safe.
+            self._set("camera-file", out)
+            return f"ok {w}x{h} frames={frames}"
+        return "err usage: camera <test-pattern|file|none> | camera?"
+
     def _verb_ase(self, args):
         """Drive the BAP unicast server's ASE state machine (0038)."""
         if self.bridge is None:
@@ -698,6 +760,8 @@ class CtlServer(threading.Thread):
                 return self._verb_magn(args)
             if verb == "tap":
                 return self._verb_tap(args)
+            if verb == "camera":
+                return self._verb_camera(args)
             if verb == "ase":
                 return self._verb_ase(args)
             if verb == "iso":
@@ -794,6 +858,15 @@ def ppm_to_png(ppm_data, out_path):
     with open(out_path, "wb") as f:
         f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
                 chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def rmtempdir(path):
+    """Remove one of the launcher's flat scratch directories."""
+    if not path:
+        return
+    for name in os.listdir(path):
+        os.unlink(os.path.join(path, name))
+    os.rmdir(path)
 
 
 _CHILD = None  # the QEMU subprocess, so a signal handler can reap it
@@ -929,6 +1002,33 @@ def main():
     if args.audio:
         machine += ",audiodev=halo"
 
+    # Camera (ticket 0033): all image decoding happens here — this QEMU
+    # build has neither libpng nor libjpeg — and the model reads the
+    # resulting HALOCAM1 container.  The scratch directory also serves
+    # the control socket's runtime `camera <src>` verb.
+    cam_dir = None
+    if args.camera or args.ctl_port:
+        cam_dir = tempfile.mkdtemp(prefix="halo-emu-cam-")
+    if args.camera:
+        sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
+        import camera_source
+
+        interval = int(round(1000.0 / args.camera_fps)) \
+            if args.camera_fps > 0 else 0
+        out = os.path.join(cam_dir, "boot.cam")
+        try:
+            width, height, frames = camera_source.build_container(
+                args.camera, out, max_frames=args.camera_max_frames,
+                interval_ms=interval)
+        except camera_source.CameraSourceError as e:
+            rmtempdir(cam_dir)
+            die(f"--camera: {e}")
+        machine += f",cam-file={out}"
+        print(f"halo-emu: camera source {args.camera} -> {width}x{height}, "
+              f"{frames} frame(s)"
+              + (f" at {args.camera_fps:g} fps" if interval else ""),
+              file=sys.stderr)
+
     cmd = [QEMU, "-M", machine, "-serial", "mon:stdio"]
     if args.audio:
         cmd += ["-audiodev", f"{args.audio},id=halo"]
@@ -975,7 +1075,7 @@ def main():
         ctl = CtlServer(os.path.join(ctl_dir, "qmp.sock"), args.ctl_port,
                         log=lambda m: print(f"halo-emu: {m}",
                                             file=sys.stderr),
-                        bridge=bridge)
+                        bridge=bridge, cam_dir=cam_dir)
     # CDC200 display window (ticket 0029): SDL unless --headless.
     cmd += ["-display", "none" if args.headless else "sdl"]
     if args.gdb:
@@ -994,7 +1094,11 @@ def main():
             run_screenshot(cmd, args)
             return
 
-        if bridge is None and ctl is None:
+        # --camera keeps this process resident too: QEMU reads the frame
+        # container at startup, so nothing could clean it up after an
+        # exec.  (With the default --ctl-port this branch is unreachable
+        # anyway.)
+        if bridge is None and ctl is None and not args.camera:
             os.execv(QEMU, cmd)
 
         # The bridge/control server live in this process, so keep it
@@ -1012,11 +1116,8 @@ def main():
             bridge.stop()
         if ctl:
             ctl.stop()
-        for d in (bridge_dir, ctl_dir):
-            if d:
-                for f in os.listdir(d):
-                    os.unlink(os.path.join(d, f))
-                os.rmdir(d)
+        for d in (bridge_dir, ctl_dir, cam_dir):
+            rmtempdir(d)
 
 
 if __name__ == "__main__":

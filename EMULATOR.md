@@ -195,7 +195,9 @@ timeouts; failure skips the splash, non-fatal).
 
 I2C0 `0x49010000`/IRQ 132: BMA580 IMU `0x18`, QMC6308 mag `0x2C` (both modeled, 0037 —
 lazy-init, so they are silent until Lua asks; inject with `accel`/`magn`/`tap`). I2C1
-`0x49011000`/IRQ 133: vga020 `0x54`, TPS65132 `0x3E`, PAG7982 camera `0x40` (0033).
+`0x49011000`/IRQ 133: vga020 `0x54`, TPS65132 `0x3E`, PAG7982 camera `0x40` (modeled,
+0033 — not lazy-init, so the driver binds at boot, but it only talks to the chip on PM
+resume, which the Lua camera service triggers).
 The controller is upstream QEMU's `designware-i2c`, **patched in `patches/files/hw/i2c/`**,
 where two upstream bugs made it unusable with a real driver — both silent, and both found
 only once a target actually checked what it received:
@@ -217,8 +219,23 @@ set and boot deadlocks.
 **Mic** (modeled, 0032): LPPDM `0x43002000`/IRQ 49, DMA PL330 `0x400C0000` (IRQs 0-4,32)
 ch4, request line 30; the read port at `CH2_CH3_AUDIO_OUT` is width-aware because
 Zephyr's PL330 driver reads it in two 16-bit beats at a fixed address per 32-bit set.
-Camera: LPCAM `0x43003000`/IRQ 54 (parallel
-8-bit). GPIO: DW banks gpio0–9 `0x49000000..0x49009000` (IRQs 179–253), LPGPIO
+**Camera** (modeled, 0033): LPCAM `0x43003000`/IRQ 54, **parallel 8-bit, not MIPI-CSI**,
+inverted H/V sync (`halo_lpcam.c`). START in `CAM_CTRL` DMAs one frame to
+`CAM_FRAME_ADDR` and raises `VSYNC | STOP`; the driver re-arms per frame from its own STOP
+handler, so one frame per START is all the hardware behavior needed. The pixel bus is not
+modeled — nothing guest-side can observe it, so the controller synthesises what the sensor
+would have driven: an RGB source mosaicked to 8-bit Bayer **BGGR** (even rows `B G`, odd
+rows `G R`), which the firmware debayers and JPEG-encodes in libmpix. Geometry comes from
+`CAM_VIDEO_FCFG` (`DATA` = width, `ROW` = height - 1) and is scaled nearest-neighbour.
+`--camera <png|pnm|jpeg|mjpeg|test-pattern>` and the `camera` control-socket verb feed it;
+**all image decoding lives in `tools/camera_source.py`** because this QEMU build has
+neither libpng nor libjpeg (`config-host.h`: `#undef CONFIG_PNG`, `#undef
+CONFIG_VNC_JPEG`), and the model only reads a raw `HALOCAM1` container. Multi-frame
+sources advance exactly one frame per delivered frame, so a run is reproducible.
+With no source the model serves a built-in gradient, which keeps `frame.camera` working
+with no `--camera` at all. One Lua `capture()` costs **three** frames
+(`LUA_CAMERA_SKIP_FRAMES`, the last one kept).
+GPIO: DW banks gpio0–9 `0x49000000..0x49009000` (IRQs 179–253), LPGPIO
 `0x42002000` (IRQs 171/172) — **button = LPGPIO pin 1, active-low**. Pinctrl `0x1A603000`/
 `0x42007000` (direct writes, no SE). BLE sync timer UTIMER0 `0x48001000` + EVTRTR
 `0x400E2000` (IRQs 377/384). Disabled in DT (not needed): all other UARTs, SPI, OSPI/XIP,

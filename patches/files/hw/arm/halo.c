@@ -165,12 +165,17 @@
 #define HALO_DSI_BASE 0x49032000
 #define HALO_DSI_IRQ 343
 
+/* LPCAM parallel camera controller + PAG7982 sensor (ticket 0033) */
+#define HALO_LPCAM_BASE 0x43003000
+#define HALO_LPCAM_IRQ 54
+
 /* I2C1 display-path targets (halo_i2c_regfile.c) */
 #define HALO_VGA020_I2C_ADDR 0x54  /* panel: 16-bit register address */
 #define HALO_TPS65132_I2C_ADDR 0x3E /* display PMIC: 8-bit registers */
 #define HALO_BMA580_I2C_ADDR 0x18  /* IMU on I2C0 (ticket 0037) */
 #define HALO_QMC6308_I2C_ADDR 0x2C /* magnetometer on I2C0 (ticket 0037) */
 #define HALO_BMA580_INT1_PIN 2     /* IMU INT1 -> gpio3.2 (int1-gpios) */
+#define HALO_PAG7982_I2C_ADDR 0x40 /* camera sensor on I2C1 (ticket 0033) */
 
 /* BLE doorbell device (synthetic ROM stub transport, halo_ble.c):
  * doorbell page + fake UTIMER0 channel; IRQ = UTIMER0 capture A, the line
@@ -221,6 +226,7 @@ struct HaloMachineState {
     char *ble_symfile;
     char *i2s_wav_out;
     char *pdm_wav_in;
+    char *cam_file;
     char *audiodev;
     uint32_t init_svtor;
 
@@ -237,6 +243,8 @@ struct HaloMachineState {
     DeviceState *pdm_dev;     /* microphone (ticket 0032) */
     DeviceState *imu_dev;     /* BMA580 accelerometer (ticket 0037) */
     DeviceState *magn_dev;    /* QMC6308 magnetometer (ticket 0037) */
+    DeviceState *cam_dev;     /* LPCAM controller (ticket 0033) */
+    DeviceState *cam_sensor_dev; /* PAG7982 on I2C1 (ticket 0033) */
     bool button_pressed;
     bool charger_connected;
     bool sram_preserve;       /* skip the TCM zeroing on the next reset */
@@ -501,6 +509,17 @@ static void halo_create_peripherals(HaloMachineState *hms,
         tgt = i2c_slave_new("halo-i2c-regfile", HALO_TPS65132_I2C_ADDR);
         qdev_prop_set_uint32(DEVICE(tgt), "addr-bytes", 1);
         i2c_slave_realize_and_unref(tgt, i2c1, &error_fatal);
+
+        /*
+         * PAG7982 camera sensor (ticket 0033).  Unlike the motion
+         * sensors this DT node is not lazy-init, so the driver binds at
+         * boot — but it only talks to the chip on PM resume, which the
+         * Lua camera service triggers.  Its part ID gates that resume,
+         * hence a model rather than a register file.
+         */
+        tgt = i2c_slave_new("halo-pag7982", HALO_PAG7982_I2C_ADDR);
+        i2c_slave_realize_and_unref(tgt, i2c1, &error_fatal);
+        hms->cam_sensor_dev = DEVICE(tgt);
     }
 
     /* CDC200 display controller: the UI window (scanline_0 IRQ only —
@@ -520,6 +539,23 @@ static void halo_create_peripherals(HaloMachineState *hms,
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, HALO_DSI_BASE);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, HALO_DSI_IRQ));
+
+    /*
+     * LPCAM parallel camera controller (ticket 0033): DMAs synthesised
+     * Bayer frames into the driver's video buffer and raises IRQ 54 per
+     * frame.  Purely additive — with no cam-file the model serves a
+     * built-in gradient, and nothing here runs until Lua wakes the
+     * camera service.
+     */
+    dev = qdev_new("halo-lpcam");
+    if (hms->cam_file) {
+        qdev_prop_set_string(dev, "cam-file", hms->cam_file);
+    }
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, HALO_LPCAM_BASE);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, HALO_LPCAM_IRQ));
+    hms->cam_dev = dev;
 
     /*
      * I2S0: the speaker.  Sinks the firmware's PCM stream to a WAV file
@@ -612,6 +648,15 @@ static void halo_create_peripherals(HaloMachineState *hms,
  *   mic-wav-in      (str, rw)   WAV file feeding the microphone
  *   mic-tone-hz / mic-tone-amplitude (uint32, rw) built-in test tone
  *   mic-source      (str, ro), mic-samples (uint32, ro)
+ *   camera-file     (str, rw)   frame file feeding the camera; "" for
+ *                               the built-in gradient
+ *   camera-source   (str, ro), camera-frames / camera-frame /
+ *   camera-captures / camera-width / camera-height (uint32, ro)
+ *                               forwarded from the LPCAM model
+ *   camera-streaming (bool, ro), camera-triggers (uint32, ro)
+ *                               PAG7982 R_TRG_EN: the sensor is
+ *                               triggered right now / how often it has
+ *                               been, which is the race-free check
  *
  * Interactive path: the 'B' key in the QEMU window presses/releases
  * the button (a plain keyboard handler — this machine has no other
@@ -740,6 +785,74 @@ static void halo_set_pdm_uint32(Object *obj, Visitor *v, const char *name,
         return;
     }
     object_property_set_uint(OBJECT(hms->pdm_dev), name, value, errp);
+}
+
+/* Camera (ticket 0033): the frame source and its readouts live on the
+ * LPCAM model, the streaming flag on the sensor's I2C register file. */
+static void halo_get_cam_uint32(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+    uint32_t value = 0;
+
+    if (hms->cam_dev) {
+        value = object_property_get_uint(OBJECT(hms->cam_dev), name, errp);
+    }
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static char *halo_get_cam_str(Object *obj, const char *name, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    if (!hms->cam_dev) {
+        return g_strdup("");
+    }
+    return object_property_get_str(OBJECT(hms->cam_dev), name, errp);
+}
+
+static char *halo_get_camera_file(Object *obj, Error **errp)
+{
+    return halo_get_cam_str(obj, "camera-file", errp);
+}
+
+static void halo_set_camera_file(Object *obj, const char *value, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    if (!hms->cam_dev) {
+        error_setg(errp, "machine is not initialized yet");
+        return;
+    }
+    object_property_set_str(OBJECT(hms->cam_dev), "camera-file", value, errp);
+}
+
+static char *halo_get_camera_source(Object *obj, Error **errp)
+{
+    return halo_get_cam_str(obj, "camera-source", errp);
+}
+
+static bool halo_get_camera_streaming(Object *obj, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    return hms->cam_sensor_dev &&
+           object_property_get_bool(OBJECT(hms->cam_sensor_dev), "streaming",
+                                    errp);
+}
+
+static void halo_get_camera_triggers(Object *obj, Visitor *v,
+                                     const char *name, void *opaque,
+                                     Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+    uint32_t value = 0;
+
+    if (hms->cam_sensor_dev) {
+        value = object_property_get_uint(OBJECT(hms->cam_sensor_dev),
+                                        "triggers", errp);
+    }
+    visit_type_uint32(v, name, &value, errp);
 }
 
 /* Motion sensors on I2C0 (ticket 0037). Samples are raw int16 LSB
@@ -1202,6 +1315,21 @@ static void halo_set_pdm_wav_in(Object *obj, const char *value, Error **errp)
     hms->pdm_wav_in = g_strdup(value);
 }
 
+static char *halo_get_cam_file(Object *obj, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    return g_strdup(hms->cam_file);
+}
+
+static void halo_set_cam_file(Object *obj, const char *value, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    g_free(hms->cam_file);
+    hms->cam_file = g_strdup(value);
+}
+
 static char *halo_get_audiodev(Object *obj, Error **errp)
 {
     HaloMachineState *hms = HALO_MACHINE(obj);
@@ -1288,6 +1416,12 @@ static void halo_machine_class_init(ObjectClass *oc, const void *data)
         "Feed this WAV file to the microphone instead of silence "
         "(16-bit, mono or stereo, looped and resampled to whatever "
         "rate the firmware asks for)");
+    object_class_property_add_str(oc, "cam-file",
+                                  halo_get_cam_file, halo_set_cam_file);
+    object_class_property_set_description(oc, "cam-file",
+        "Frame file feeding the camera (HALOCAM1 container, written by "
+        "halo-emu --camera from a PNG/PNM/JPEG/MJPEG or its test "
+        "pattern); omit for the LPCAM model's built-in gradient");
     object_class_property_add_str(oc, "audiodev",
                                   halo_get_audiodev, halo_set_audiodev);
     object_class_property_set_description(oc, "audiodev",
@@ -1407,6 +1541,46 @@ static void halo_machine_class_init(ObjectClass *oc, const void *data)
                                   halo_get_mic_source, NULL);
     object_class_property_set_description(oc, "mic-source",
         "Where microphone samples come from: wav, tone, host or silence");
+
+    /* Camera (ticket 0033) */
+    object_class_property_add_str(oc, "camera-file",
+                                  halo_get_camera_file,
+                                  halo_set_camera_file);
+    object_class_property_set_description(oc, "camera-file",
+        "Frame file feeding the camera; set to \"\" for the built-in "
+        "gradient");
+    object_class_property_add_str(oc, "camera-source",
+                                  halo_get_camera_source, NULL);
+    object_class_property_set_description(oc, "camera-source",
+        "Where camera frames come from: file or gradient");
+    object_class_property_add(oc, "camera-frames", "uint32",
+                              halo_get_cam_uint32, NULL, NULL, NULL);
+    object_class_property_set_description(oc, "camera-frames",
+        "Frames in the loaded source (1 for a still image)");
+    object_class_property_add(oc, "camera-frame", "uint32",
+                              halo_get_cam_uint32, NULL, NULL, NULL);
+    object_class_property_set_description(oc, "camera-frame",
+        "Index of the next source frame to be delivered");
+    object_class_property_add(oc, "camera-captures", "uint32",
+                              halo_get_cam_uint32, NULL, NULL, NULL);
+    object_class_property_set_description(oc, "camera-captures",
+        "Frames the LPCAM controller has DMA'd since reset (one Lua "
+        "capture is 3: LUA_CAMERA_SKIP_FRAMES, the last one kept)");
+    object_class_property_add(oc, "camera-width", "uint32",
+                              halo_get_cam_uint32, NULL, NULL, NULL);
+    object_class_property_add(oc, "camera-height", "uint32",
+                              halo_get_cam_uint32, NULL, NULL, NULL);
+    object_class_property_set_description(oc, "camera-height",
+        "Frame geometry the guest programmed into CAM_VIDEO_FCFG");
+    object_class_property_add_bool(oc, "camera-streaming",
+                                   halo_get_camera_streaming, NULL);
+    object_class_property_set_description(oc, "camera-streaming",
+        "PAG7982 R_TRG_EN: the sensor is triggered right now");
+    object_class_property_add(oc, "camera-triggers", "uint32",
+                              halo_get_camera_triggers, NULL, NULL, NULL);
+    object_class_property_set_description(oc, "camera-triggers",
+        "How often the firmware has triggered the sensor over I2C; "
+        "unlike camera-streaming this cannot be missed between captures");
 }
 
 static const TypeInfo halo_machine_types[] = {
