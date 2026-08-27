@@ -193,7 +193,18 @@ def main():
                     "channels=1} print('mic')")
         check("microphone start", out == "mic", repr(out))
         time.sleep(2.0)   # past the driver's 20 ms start-of-stream discard
-        got = summarise(r, "frame.microphone.read(320)")
+        # read() drains a FIFO from the *start* of the stream, not live
+        # audio, so the first window always lands in the firmware's
+        # start-of-stream ramp: consecutive 10 ms windows measure
+        # 4383 -> 7297 -> 10901 -> 12017 and then hold steady. Measuring
+        # the first window made this check flaky (it passed or failed on
+        # where the ramp fell inside it), so drain the ramp first. The
+        # frequency is correct throughout — only the level ramps.
+        got = None
+        for _ in range(8):
+            got = summarise(r, "frame.microphone.read(320)")
+            if got is None or got[1] > TONE_AMP * 0.75:
+                break
         check("microphone returns samples", got is not None)
         n, mx, zc = got
         check("microphone sample count", n == 320, f"{n} bytes")

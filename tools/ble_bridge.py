@@ -161,7 +161,12 @@ class ReplBridge(threading.Thread):
             if hdl is not None and self._atts.get(hdl + 1) == CCC_UUID:
                 hdls[name + "_ccc"] = hdl + 1
         if "rx" in hdls and "tx" in hdls and "tx_ccc" in hdls:
-            if hdls != self._handles:
+            # Log only when the handles we print actually change: this runs on
+            # every EVT_ATT, and the dict keeps growing as the video/audio
+            # attributes stream in after rx/tx are already known.
+            prev = self._handles
+            if prev is None or (prev["rx"], prev["tx"]) != (hdls["rx"],
+                                                            hdls["tx"]):
                 self.log(f"Lua service resolved: rx=0x{hdls['rx']:04x} "
                          f"tx=0x{hdls['tx']:04x}")
             self._handles = hdls

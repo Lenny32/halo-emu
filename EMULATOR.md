@@ -181,12 +181,27 @@ timeouts; failure skips the splash, non-fatal).
 
 ## Other peripherals (lazy-init, non-fatal)
 
-I2C0 `0x49010000`/IRQ 132: BMA580 IMU `0x18`, QMC6308 mag `0x2C`. I2C1 `0x49011000`/IRQ
-133: vga020 `0x54`, TPS65132 `0x3E`, PAG7982 camera `0x40`. **Audio out** (modeled,
-0032): `alif,i2s-sync` `0x49014000`/IRQ 141 (ISR in DTCM) + MAX98357A (gpio8.5); 16-deep
-TX FIFO, trigger 8, `ISR.TXFE` is a level and the driver's ISR refills until the FIFO is
-above it — but TXFE must stay low until the first sample clocks out, or the level IRQ
-raised inside `i2s_send()` re-enters before `tx.running` is set and boot deadlocks.
+I2C0 `0x49010000`/IRQ 132: BMA580 IMU `0x18`, QMC6308 mag `0x2C` (both modeled, 0037 —
+lazy-init, so they are silent until Lua asks; inject with `accel`/`magn`/`tap`). I2C1
+`0x49011000`/IRQ 133: vga020 `0x54`, TPS65132 `0x3E`, PAG7982 camera `0x40` (0033).
+The controller is upstream QEMU's `designware-i2c`, **patched in `patches/files/hw/i2c/`**,
+where two upstream bugs made it unusable with a real driver — both silent, and both found
+only once a target actually checked what it received:
+- **`IC_STATUS` was never updated** except for `ACTIVITY`, so `RFNE` never set. Zephyr's
+  `i2c_dw` drains RX with `while (test_bit_status_rfne(...))`, so every read returned
+  `-EIO` (0035). Keep the FIFO status bits in sync with `rx_fifo`.
+- **The repeated START was issued after the byte, not before it** (0037). The guest tags
+  the *first* byte of a message with RESTART; upstream ran its restart block after the
+  send, so a two-byte register write `[reg, value]` got a START between the bytes and the
+  target filed `value` as a fresh register address. Reads were unaffected (their restart
+  already preceded the receive), which is why the display path appeared to work — nothing
+  there ever verified a written register.
+
+**Audio out** (modeled, 0032): `alif,i2s-sync` `0x49014000`/IRQ 141 (ISR in DTCM) +
+MAX98357A (gpio8.5); 16-deep TX FIFO, trigger 8, `ISR.TXFE` is a level and the driver's
+ISR refills until the FIFO is above it — but TXFE must stay low until the first sample
+clocks out, or the level IRQ raised inside `i2s_send()` re-enters before `tx.running` is
+set and boot deadlocks.
 **Mic** (modeled, 0032): LPPDM `0x43002000`/IRQ 49, DMA PL330 `0x400C0000` (IRQs 0-4,32)
 ch4, request line 30; the read port at `CH2_CH3_AUDIO_OUT` is width-aware because
 Zephyr's PL330 driver reads it in two 16-bit beats at a fixed address per 32-bit set.

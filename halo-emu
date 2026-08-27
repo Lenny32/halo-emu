@@ -46,6 +46,20 @@ device the way a tester drives hardware.  One command per line, reply
     speaker?                -> ok enabled=0|1 playing=0|1 rate=..
                                samples=..  (enabled = MAX98357A
                                SD_MODE on gpio8.5)
+    accel <x> <y> <z>       set the IMU sample in milli-g, device axes;
+                            range is 2 g, so |value| <= 2000. The Lua
+                            direction() remaps device->host as up = X,
+                            right = -Z, forward = Y, so `accel 1000 0 0`
+                            is worn-level (pitch/roll 0) and
+                            `accel 0 0 1000` is roll -90. Both sensors
+                            are lazy-init: nothing probes them until Lua
+                            asks
+    accel?                  -> ok x=.. y=.. z=.. (mg) raw=..,..,..
+    magn <x> <y> <z>        set the magnetometer in milli-gauss
+    magn?                   -> ok x=.. y=.. z=.. (mgauss) raw=..
+    tap [single|double|triple]
+                            fire an IMU tap on INT1 (gpio3.2), the
+                            trigger the Lua imu tap callbacks use
     reboot                  full machine reset (MRAM/lfs preserved)
     wdt-fire                inject a watchdog timeout: NMI, then a
                             TCM-preserving warm reset 200 ms later
@@ -116,6 +130,7 @@ image in -f.
 import argparse
 import json
 import os
+import signal
 import socket
 import struct
 import subprocess
@@ -510,6 +525,57 @@ class CtlServer(threading.Thread):
         return "err usage: mic wav <file> | mic tone <hz> [amp] | " \
                "mic silence | mic?"
 
+    # Raw-LSB conversions for the motion sensors (ticket 0037). The
+    # machine keeps chip units; these are the scales the firmware
+    # programs by default. BMA580: the devicetree's `range = <2>` is
+    # 2 g (DT_INST_ENUM_IDX -> BMA5_ACC_RANGE_MAX_2G = 0), which
+    # bma580_driver.c scales at 16384 LSB/g — not the 8 g case.
+    # QMC6308: 30 G range, qmc6308.c lsb_to_m = 1000. Orientation and
+    # heading are ratios, so a scale mismatch would not change them.
+    ACCEL_LSB_PER_G = 16384
+    MAGN_LSB_PER_GAUSS = 1000
+
+    def _verb_accel(self, args):
+        axes = ("accel-x", "accel-y", "accel-z")
+        if args == ["?"]:
+            raw = [int(self._get(a)) for a in axes]
+            mg = [round(r * 1000 / self.ACCEL_LSB_PER_G) for r in raw]
+            return (f"ok x={mg[0]} y={mg[1]} z={mg[2]} (mg) "
+                    f"raw={raw[0]},{raw[1]},{raw[2]}")
+        if len(args) == 3:
+            for axis, val in zip(axes, args):
+                raw = round(int(val) * self.ACCEL_LSB_PER_G / 1000)
+                if not -32768 <= raw <= 32767:
+                    return f"err {axis} out of range (max +-8000 mg)"
+                self._set(axis, raw)
+            return "ok"
+        return "err usage: accel <x> <y> <z>  (milli-g) | accel?"
+
+    def _verb_magn(self, args):
+        axes = ("magn-x", "magn-y", "magn-z")
+        if args == ["?"]:
+            raw = [int(self._get(a)) for a in axes]
+            mg = [round(r * 1000 / self.MAGN_LSB_PER_GAUSS) for r in raw]
+            return (f"ok x={mg[0]} y={mg[1]} z={mg[2]} (mgauss) "
+                    f"raw={raw[0]},{raw[1]},{raw[2]}")
+        if len(args) == 3:
+            for axis, val in zip(axes, args):
+                raw = round(int(val) * self.MAGN_LSB_PER_GAUSS / 1000)
+                if not -32768 <= raw <= 32767:
+                    return f"err {axis} out of range (max +-32767 mgauss)"
+                self._set(axis, raw)
+            return "ok"
+        return "err usage: magn <x> <y> <z>  (milli-gauss) | magn?"
+
+    def _verb_tap(self, args):
+        kinds = {"single": 1, "double": 2, "triple": 3}
+        if not args:
+            args = ["single"]
+        if len(args) == 1 and args[0] in kinds:
+            self._set("tap", kinds[args[0]])
+            return "ok"
+        return "err usage: tap [single|double|triple]"
+
     def _verb_speaker(self, args):
         en = int(self._get("speaker-enabled"))
         playing = int(self._get("speaker-playing"))
@@ -545,6 +611,12 @@ class CtlServer(threading.Thread):
                 return self._verb_speaker(args)
             if verb == "mic":
                 return self._verb_mic(args)
+            if verb == "accel":
+                return self._verb_accel(args)
+            if verb in ("magn", "mag"):
+                return self._verb_magn(args)
+            if verb == "tap":
+                return self._verb_tap(args)
             if verb == "reboot" and not args:
                 self._cmd("system_reset")
                 return "ok"
@@ -639,6 +711,65 @@ def ppm_to_png(ppm_data, out_path):
                 chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 
 
+_CHILD = None  # the QEMU subprocess, so a signal handler can reap it
+
+
+def _set_child(proc):
+    global _CHILD
+    _CHILD = proc
+
+
+def _reap_child():
+    """Terminate the QEMU child if it is still running."""
+    global _CHILD
+    proc, _CHILD = _CHILD, None
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def _signal_child(sig):
+    """Forward a signal to QEMU without touching subprocess internals.
+
+    This runs from a signal handler, which executes on the main thread —
+    possibly interrupting it inside Popen.wait(). Popen.wait() is not
+    reentrant (it holds _waitpid_lock), so calling it here would deadlock
+    the launcher and leave QEMU a zombie. Only send the signal; the child
+    is reaped by _reap_child() once the stack has unwound.
+    """
+    proc = _CHILD
+    if proc is not None and proc.returncode is None:
+        try:
+            os.kill(proc.pid, sig)
+        except ProcessLookupError:
+            pass
+
+
+def _install_term_handlers():
+    """Shut QEMU down on SIGTERM/SIGHUP.
+
+    QEMU runs as a child whenever the REPL bridge or control socket is
+    enabled, so the default SIGTERM disposition would kill the launcher
+    outright: the cleanup below never runs, QEMU is orphaned (it keeps
+    running at full speed, competing for CPU with the next run) and the
+    bridge/control temp dirs leak. Raising SystemExit instead unwinds
+    through proc.wait() into the finally blocks. SIGINT is deliberately
+    left alone — QEMU owns the terminal and gets Ctrl-C directly through
+    the foreground process group.
+    """
+    def handler(signum, frame):
+        _signal_child(signal.SIGTERM)
+        raise SystemExit(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, handler)
+
+
 def run_screenshot(cmd, args):
     """Boot under QMP control, screendump after the delay, shut down."""
     qmp_dir = tempfile.mkdtemp(prefix="halo-emu-qmp-")
@@ -647,6 +778,7 @@ def run_screenshot(cmd, args):
     cmd += ["-qmp", f"unix:{qmp_path},server=on,wait=off"]
 
     proc = subprocess.Popen(cmd)
+    _set_child(proc)
     try:
         time.sleep(args.screenshot_after)
         if proc.poll() is not None:
@@ -674,6 +806,7 @@ def run_screenshot(cmd, args):
 
 def main():
     args, extra = parse_args()
+    _install_term_handlers()
     if not os.access(QEMU, os.X_OK):
         die(f"QEMU binary not found/executable: {QEMU} "
             "(build the fork first — see README.md)")
@@ -781,12 +914,14 @@ def main():
         # The bridge/control server live in this process, so keep it
         # alive alongside QEMU instead of exec'ing over it.
         proc = subprocess.Popen(cmd)
+        _set_child(proc)
         while True:
             try:
                 sys.exit(proc.wait())
             except KeyboardInterrupt:
                 continue  # QEMU owns the terminal; let it shut down
     finally:
+        _reap_child()
         if bridge:
             bridge.stop()
         if ctl:

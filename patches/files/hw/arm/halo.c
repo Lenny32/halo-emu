@@ -168,6 +168,9 @@
 /* I2C1 display-path targets (halo_i2c_regfile.c) */
 #define HALO_VGA020_I2C_ADDR 0x54  /* panel: 16-bit register address */
 #define HALO_TPS65132_I2C_ADDR 0x3E /* display PMIC: 8-bit registers */
+#define HALO_BMA580_I2C_ADDR 0x18  /* IMU on I2C0 (ticket 0037) */
+#define HALO_QMC6308_I2C_ADDR 0x2C /* magnetometer on I2C0 (ticket 0037) */
+#define HALO_BMA580_INT1_PIN 2     /* IMU INT1 -> gpio3.2 (int1-gpios) */
 
 /* BLE doorbell device (synthetic ROM stub transport, halo_ble.c):
  * doorbell page + fake UTIMER0 channel; IRQ = UTIMER0 capture A, the line
@@ -226,11 +229,14 @@ struct HaloMachineState {
     DeviceState *gpio0_dev;   /* charge-control output on pin 6 */
     DeviceState *gpio1_dev;   /* charger-state input on pin 3 */
     DeviceState *gpio8_dev;   /* speaker SD_MODE output on pin 5 */
+    DeviceState *gpio3_dev;   /* IMU INT1 input on pin 2 (ticket 0037) */
     DeviceState *adc_dev;
     DeviceState *utimer_dev;
     DeviceState *wdog_dev;
     DeviceState *i2s_dev;     /* speaker (ticket 0032) */
     DeviceState *pdm_dev;     /* microphone (ticket 0032) */
+    DeviceState *imu_dev;     /* BMA580 accelerometer (ticket 0037) */
+    DeviceState *magn_dev;    /* QMC6308 magnetometer (ticket 0037) */
     bool button_pressed;
     bool charger_connected;
     bool sram_preserve;       /* skip the TCM zeroing on the next reset */
@@ -428,6 +434,8 @@ static void halo_create_peripherals(HaloMachineState *hms,
             hms->gpio0_dev = dev;
         } else if (!strcmp(halo_gpio_banks[i].name, "gpio1")) {
             hms->gpio1_dev = dev;
+        } else if (!strcmp(halo_gpio_banks[i].name, "gpio3")) {
+            hms->gpio3_dev = dev;
         } else if (!strcmp(halo_gpio_banks[i].name, "gpio8")) {
             hms->gpio8_dev = dev;
         } else if (!strcmp(halo_gpio_banks[i].name, "lpgpio")) {
@@ -446,6 +454,29 @@ static void halo_create_peripherals(HaloMachineState *hms,
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, HALO_I2C0_BASE);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, HALO_I2C0_IRQ));
+
+    /*
+     * I2C0 motion sensors (ticket 0037).  Both are lazy-init in the
+     * devicetree, so nothing touches them until Lua asks — but the
+     * drivers gate on a chip-ID read, which a plain register file
+     * cannot answer.  The IMU also drives INT1 into gpio3.2 for the
+     * tap triggers (bma580 "int1-gpios = <&gpio3 2 0>").
+     */
+    {
+        I2CBus *i2c0 = I2C_BUS(qdev_get_child_bus(dev, "i2c-bus"));
+        I2CSlave *tgt;
+
+        tgt = i2c_slave_new("halo-bma580", HALO_BMA580_I2C_ADDR);
+        i2c_slave_realize_and_unref(tgt, i2c0, &error_fatal);
+        hms->imu_dev = DEVICE(tgt);
+        qdev_connect_gpio_out_named(hms->imu_dev, "int1", 0,
+            qdev_get_gpio_in_named(hms->gpio3_dev, "in",
+                                   HALO_BMA580_INT1_PIN));
+
+        tgt = i2c_slave_new("halo-qmc6308", HALO_QMC6308_I2C_ADDR);
+        i2c_slave_realize_and_unref(tgt, i2c0, &error_fatal);
+        hms->magn_dev = DEVICE(tgt);
+    }
 
     dev = qdev_new("designware-i2c");
     sbd = SYS_BUS_DEVICE(dev);
@@ -709,6 +740,78 @@ static void halo_set_pdm_uint32(Object *obj, Visitor *v, const char *name,
         return;
     }
     object_property_set_uint(OBJECT(hms->pdm_dev), name, value, errp);
+}
+
+/* Motion sensors on I2C0 (ticket 0037). Samples are raw int16 LSB
+ * counts, like battery-raw is a raw ADC code: the conversion to g /
+ * gauss depends on the range the firmware programs, so the machine
+ * stays in chip units and halo-emu's control socket does the friendly
+ * milli-g / milli-gauss arithmetic. */
+static void halo_get_imu_int(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+    int64_t value = 0;
+
+    if (hms->imu_dev) {
+        value = object_property_get_int(OBJECT(hms->imu_dev), name, errp);
+    }
+    visit_type_int(v, name, &value, errp);
+}
+
+static void halo_set_imu_int(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+    int64_t value;
+
+    if (!visit_type_int(v, name, &value, errp)) {
+        return;
+    }
+    if (!hms->imu_dev) {
+        error_setg(errp, "machine is not initialized yet");
+        return;
+    }
+    object_property_set_int(OBJECT(hms->imu_dev), name, value, errp);
+}
+
+static void halo_get_magn_int(Object *obj, Visitor *v, const char *name,
+                              void *opaque, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+    int64_t value = 0;
+
+    if (hms->magn_dev) {
+        value = object_property_get_int(OBJECT(hms->magn_dev), name, errp);
+    }
+    visit_type_int(v, name, &value, errp);
+}
+
+static void halo_set_magn_int(Object *obj, Visitor *v, const char *name,
+                              void *opaque, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+    int64_t value;
+
+    if (!visit_type_int(v, name, &value, errp)) {
+        return;
+    }
+    if (!hms->magn_dev) {
+        error_setg(errp, "machine is not initialized yet");
+        return;
+    }
+    object_property_set_int(OBJECT(hms->magn_dev), name, value, errp);
+}
+
+static void halo_set_imu_drdy(Object *obj, bool value, Error **errp)
+{
+    HaloMachineState *hms = HALO_MACHINE(obj);
+
+    if (!hms->imu_dev) {
+        error_setg(errp, "machine is not initialized yet");
+        return;
+    }
+    object_property_set_bool(OBJECT(hms->imu_dev), "data-ready", value, errp);
 }
 
 static char *halo_get_mic_str(Object *obj, const char *name, Error **errp)
@@ -1210,6 +1313,41 @@ static void halo_machine_class_init(ObjectClass *oc, const void *data)
                                    halo_get_charge_enabled, NULL);
     object_class_property_set_description(oc, "charge-enabled",
         "Firmware charge-control output (gpio0.6): false = charge cut");
+    /* Motion sensors (ticket 0037) */
+    object_class_property_add(oc, "accel-x", "int",
+                              halo_get_imu_int, halo_set_imu_int,
+                              NULL, NULL);
+    object_class_property_add(oc, "accel-y", "int",
+                              halo_get_imu_int, halo_set_imu_int,
+                              NULL, NULL);
+    object_class_property_add(oc, "accel-z", "int",
+                              halo_get_imu_int, halo_set_imu_int,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "accel-z",
+        "BMA580 sample, raw int16 LSB counts (2 g range: 16384 LSB/g)");
+    object_class_property_add(oc, "temp", "int",
+                              halo_get_imu_int, halo_set_imu_int,
+                              NULL, NULL);
+    object_class_property_add(oc, "tap", "int",
+                              NULL, halo_set_imu_int, NULL, NULL);
+    object_class_property_set_description(oc, "tap",
+        "Inject a tap on the IMU: 1 = single, 2 = double, 3 = triple");
+    object_class_property_add_bool(oc, "data-ready", NULL,
+                                   halo_set_imu_drdy);
+    object_class_property_set_description(oc, "data-ready",
+        "Assert/clear the IMU accel data-ready interrupt on INT1");
+    object_class_property_add(oc, "magn-x", "int",
+                              halo_get_magn_int, halo_set_magn_int,
+                              NULL, NULL);
+    object_class_property_add(oc, "magn-y", "int",
+                              halo_get_magn_int, halo_set_magn_int,
+                              NULL, NULL);
+    object_class_property_add(oc, "magn-z", "int",
+                              halo_get_magn_int, halo_set_magn_int,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "magn-z",
+        "QMC6308 sample, raw int16 LSB counts (30 G range: 1000 LSB/G)");
+
     object_class_property_add(oc, "battery-raw", "uint32",
                               halo_get_adc_uint32, halo_set_battery_raw,
                               NULL, NULL);

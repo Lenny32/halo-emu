@@ -127,9 +127,14 @@ static int i2c1_write_read(uint8_t addr, const uint8_t *wbuf, int wlen,
         /* repeated-start on the write->read direction change */
         reg_write(IC_DATA_CMD, CMD_READ | (i == 0 ? CMD_RESTART : 0) |
                                (i == rlen - 1 ? CMD_STOP : 0));
-        for (int j = 0; j < 100000 && !reg_read(IC_RXFLR); j++) {
+        /* Wait on IC_STATUS.RFNE, exactly like Zephyr's i2c_dw does
+         * (i2c_dw_data_read()): polling IC_RXFLR instead would pass even
+         * with the FIFO status bits unmodelled, which is how the RFNE bug
+         * fixed in 0035 slipped past this gate. */
+        for (int j = 0; j < 100000 && !(reg_read(IC_STATUS) & STATUS_RFNE);
+             j++) {
         }
-        if (!reg_read(IC_RXFLR)) {
+        if (!(reg_read(IC_STATUS) & STATUS_RFNE)) {
             return 0;
         }
         rbuf[i] = reg_read(IC_DATA_CMD) & 0xff;

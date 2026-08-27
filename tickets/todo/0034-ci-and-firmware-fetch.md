@@ -24,6 +24,11 @@ job that keeps the emulator green against firmware releases.
    depend on any local checkout.
 3. Version matrix note: the synthetic ROM stub is pinned to ROM map v1_2 — CI should fail
    loudly (not obscurely) when a release moves to a different ROM image version.
+4. Running the smoke suite in sequence is safe as of **0036**: `halo-emu` now reaps QEMU on
+   SIGTERM/SIGHUP, so runs no longer leak an orphaned emulator that competes for CPU with
+   the next test (the suspected cause of a one-off `smoke_audio` amplitude failure). CI
+   should still assert no stray `qemu-system-arm` survives a job, so a regression of that
+   teardown is caught in CI rather than as a mystery flake.
 
 ## Gate (acceptance)
 

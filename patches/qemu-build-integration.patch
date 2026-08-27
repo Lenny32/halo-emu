@@ -23,7 +23,7 @@ diff --git a/hw/arm/meson.build b/hw/arm/meson.build
 index 4233a80..b6e0f72 100644
 --- a/hw/arm/meson.build
 +++ b/hw/arm/meson.build
-@@ -3,6 +3,22 @@ arm_common_ss.add(when: 'CONFIG_ARM_VIRT', if_true: files('virt.c'))
+@@ -3,6 +3,24 @@ arm_common_ss.add(when: 'CONFIG_ARM_VIRT', if_true: files('virt.c'))
  arm_common_ss.add(when: 'CONFIG_ACPI', if_true: files('virt-acpi-build.c'))
  arm_common_ss.add(when: 'CONFIG_DIGIC', if_true: files('digic_boards.c'))
  arm_common_ss.add(when: 'CONFIG_EMCRAFT_SF2', if_true: files('msf2-som.c'))
@@ -39,6 +39,8 @@ index 4233a80..b6e0f72 100644
 +  'halo_cdc200.c',
 +  'halo_dsi.c',
 +  'halo_i2c_regfile.c',
++  'halo_bma580.c',
++  'halo_qmc6308.c',
 +  'halo_wav.c',
 +  'halo_i2s.c',
 +  'halo_pdm.c',
