@@ -91,14 +91,48 @@ def check(name, ok, detail=""):
         raise AssertionError(name)
 
 
+def wait_for_repl(port, timeout, proc=None):
+    """Block until the Lua runtime answers on `port`, or give up.
+
+    Booting to the Lua runtime takes ~10 s of guest time here and rather
+    more on a slow CI runner, so poll for the runtime instead of sleeping
+    a fixed amount: the fast case costs nothing and the slow case does
+    not fail spuriously.  The bridge accepts TCP before the guest is up,
+    so a connect alone proves nothing — evaluate something.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc is not None and proc.poll() is not None:
+            sys.exit(f"repl_smoke: halo-emu exited early "
+                     f"({proc.returncode})")
+        try:
+            r = Repl(port, timeout=5)
+        except OSError:
+            time.sleep(1.0)
+            continue
+        try:
+            r.send(0, b"\x03")  # interrupt whatever main.lua is doing
+            time.sleep(0.5)
+            r.drain()
+            if r.lua("print('up')", timeout=5) == "up":
+                return r
+        except OSError:
+            pass
+        r.close()
+        time.sleep(1.0)
+    sys.exit(f"repl_smoke: Lua runtime did not answer within {timeout:g}s")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("-f", "--firmware",
                    default=os.path.join(REPO, "0.8.8.bin"),
                    help="firmware image (default: ./0.8.8.bin)")
     p.add_argument("--port", type=int, default=9563)
-    p.add_argument("--boot-wait", type=float, default=20.0,
-                   help="seconds to wait for the Lua runtime after boot")
+    p.add_argument("--boot-wait", type=float, default=120.0,
+                   help="seconds to wait for the Lua runtime to answer "
+                        "(default 120; the probe returns as soon as it "
+                        "does, so a fast host is not slowed down)")
     args = p.parse_args()
 
     if not os.path.exists(args.firmware):
@@ -111,13 +145,7 @@ def main():
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     ok = False
     try:
-        time.sleep(args.boot_wait)
-        if proc.poll() is not None:
-            sys.exit(f"repl_smoke: halo-emu exited early "
-                     f"({proc.returncode})")
-
-        r = Repl(args.port)
-        time.sleep(1.0)
+        r = wait_for_repl(args.port, args.boot_wait, proc)
 
         # 1. REPL echo
         out = r.lua("print('echo-check')")

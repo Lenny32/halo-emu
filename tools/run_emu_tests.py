@@ -26,6 +26,8 @@ emulator); --all runs every `auto` test in the suite's manifest.
 import argparse
 import os
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -87,11 +89,13 @@ class Emulator:
     """halo-emu under our control, relaunched on exit (reboot = the
     machine resets in place, but a QEMU exit must not kill the run)."""
 
-    def __init__(self, firmware, flash, port, ctl_port):
+    def __init__(self, firmware, flash, port, ctl_port,
+                 boot_timeout=120.0):
         self.firmware = firmware
         self.flash = flash
         self.port = port
         self.ctl_port = ctl_port
+        self.boot_timeout = boot_timeout
         self.proc = None
 
     def launch(self):
@@ -108,7 +112,50 @@ class Emulator:
                       f"({self.proc.returncode}); relaunching on the "
                       f"same MRAM{RESET}")
             self.launch()
-            time.sleep(20)  # boot to the Lua runtime
+            self.wait_ready()
+
+    def wait_ready(self):
+        """Wait for the Lua runtime to answer on the REPL port.
+
+        Booting to the runtime is ~10 s of guest time on a fast host and
+        a good deal more on a CI runner, so poll rather than sleep a
+        fixed amount — the bridge accepts TCP before the guest is up, so
+        only an evaluated statement proves readiness.  The probe closes
+        its connection before returning: the bridge serves one client at
+        a time and the test owns the next one.
+        """
+        deadline = time.monotonic() + self.boot_timeout
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                return  # ensure_running() relaunches on the next test
+            try:
+                sock = socket.create_connection(("127.0.0.1", self.port),
+                                                timeout=5)
+            except OSError:
+                time.sleep(1.0)
+                continue
+            try:
+                sock.settimeout(5)
+                sock.sendall(struct.pack("<BH", 0, 1) + b"\x03")
+                time.sleep(0.5)
+                probe = b"print('up')"
+                sock.sendall(struct.pack("<BH", 0, len(probe)) + probe)
+                deadline_probe = time.monotonic() + 6
+                buf = b""
+                while time.monotonic() < deadline_probe:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if b"up" in buf:
+                        return
+            except OSError:
+                pass
+            finally:
+                sock.close()
+            time.sleep(1.0)
+        print(f"{DIM}runner: warning: the Lua runtime did not answer "
+              f"within {self.boot_timeout:g}s; running anyway{RESET}")
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
@@ -171,6 +218,10 @@ def main():
     p.add_argument("--keep-flash", metavar="IMG",
                    help="use (and keep) this MRAM image instead of a "
                         "fresh throwaway one")
+    p.add_argument("--boot-timeout", type=float, default=120.0,
+                   help="seconds to wait for the Lua runtime to answer "
+                        "after a (re)launch, before running tests anyway "
+                        "(default 120)")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="print each test's output")
     args = p.parse_args()
@@ -194,7 +245,8 @@ def main():
     else:
         flash = tempfile.mktemp(prefix="halo-emu-tests-", suffix=".img")
 
-    emu = Emulator(args.firmware, flash, args.port, args.ctl_port)
+    emu = Emulator(args.firmware, flash, args.port, args.ctl_port,
+                   boot_timeout=args.boot_timeout)
     results = []
     try:
         emu.ensure_running()

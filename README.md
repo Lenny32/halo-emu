@@ -3,11 +3,20 @@
 Goal: **run the real device firmware binary**, unmodified —
 
 ```sh
-halo-emu -f zephyr.bin        # a firmware you built in ~/halo-firmware or downloaded
+./init.sh                     # once: fetch + build the QEMU fork and the ROM stub
+./halo-emu --fetch latest     # download the newest firmware release and run it
+./halo-emu -f zephyr.bin      # or a firmware you built in ~/halo-firmware
 ```
 
 — with the 256×256 UI in a window, `/lfs` persisted to a host file, and the Lua REPL on
 `tcp://127.0.0.1:9563`.
+
+`--fetch <tag|latest>` (ticket 0034) pulls a release of
+`brilliantlabsAR/halo-firmware` into `firmwares/<tag>/` and boots it, so a clean clone
+needs neither a firmware checkout nor a firmware build toolchain.
+`.github/workflows/ci.yml` does exactly that on every push and nightly: build the QEMU
+fork (cached), boot the release headless, run the REPL smoke and the M1 device-test
+subset. See `EMULATOR.md` for the details.
 
 ## Architecture decision (2026-08-24)
 
@@ -53,7 +62,7 @@ Key strategy points:
 | 0031 | inputs-and-controls | button, battery, LED readout, reboot/wdt hooks |
 | 0032 | audio-optional | speaker to WAV/host audio, mic from WAV/tone, LC3 via liblc3 |
 | 0033 | camera-optional | camera from host files (optional) |
-| 0034 | ci-and-firmware-fetch | `--fetch <version>`, CI smoke |
+| 0034 | ci-and-firmware-fetch | `halo-emu --fetch <version>`, ROM-map guard, GitHub Actions boot/REPL/device-test smoke |
 
 Sizing honesty: 0025–0027 are each days-to-a-week; **0028 is weeks** (the API surface of
 the ROM stub is reverse-engineered from headers + the link map); 0029–0030 about a week

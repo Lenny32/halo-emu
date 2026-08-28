@@ -1,17 +1,20 @@
 # Halo emulator — target UX and hardware reference
 
-**Status: rebuilding.** The QEMU-based emulator is being implemented ticket by ticket
-(see `README.md`). As of ticket 0032 the real firmware boots all the way through: console
+**Status: complete through ticket 0039.** The QEMU-based emulator was implemented
+ticket by ticket (see `README.md`). The real firmware boots all the way through: console
 banner + logs, littlefs mounted, BLE up on the synthetic ROM stub, the 256×256 UI in a
 window, the Lua REPL on TCP 9563, the runtime controls (button, battery, charger, LED,
-reboot, watchdog) on TCP 9562, and audio both ways — speaker, microphone and a working
-LC3 codec — `./halo-emu -f zephyr.bin`. Remaining: camera (0033), CI + firmware fetch
-(0034). The retired native_sim emulator lives at git tag `archive/native-sim`.
+reboot, watchdog, IMU/magnetometer, LE Audio) on TCP 9562, audio both ways — speaker,
+microphone and a working LC3 codec — and the camera:
+`./halo-emu -f zephyr.bin`, or `./halo-emu --fetch latest` with no firmware to hand.
+CI (ticket 0034) boots each firmware release headless on every push and nightly.
+The retired native_sim emulator lives at git tag `archive/native-sim`.
 
 ## Target UX
 
 ```sh
 ./init.sh                                  # once: fetch + build the QEMU fork (ticket 0025)
+./halo-emu --fetch latest                  # download the newest release and run it (0034)
 ./halo-emu -f zephyr.bin                   # run a firmware (built or downloaded)
 ./halo-emu -f zephyr.signed.bin            # signed images load identically
 ./halo-emu -f fw.bin --flash mram.img      # named persistent MRAM (default ./mram.img)
@@ -22,6 +25,7 @@ LC3 codec — `./halo-emu -f zephyr.bin`. Remaining: camera (0033), CI + firmwar
 ./halo-emu -f fw.bin --wav-in voice.wav    # feed the microphone from a file
 ./halo-emu -f fw.bin --audio               # live host playback/capture (SDL; try pa)
 ./halo-emu --fetch 0.8.8                   # download + run a GitHub release (ticket 0034)
+./halo-emu --fetch latest --fetch-debug    # the -debug asset (the build with the banner)
 ```
 
 The Lua REPL is served on `tcp://127.0.0.1:9563` by default (ticket 0030,
@@ -99,6 +103,31 @@ tests that `print(frame.GIT_TAG)` with `await_print` hang on any transport
 (hardware included) — `print("")` emits nothing. Build the image from a git
 checkout (`west build -b halo --sysbuild alif/applications/halo`) for the
 full device-test subset.
+
+**Firmware fetch and CI** (ticket 0034). `--fetch <tag|latest>` downloads a release of
+`brilliantlabsAR/halo-firmware` into `firmwares/<tag>/` (gitignored; `$HALO_EMU_CACHE`
+relocates the cache) and boots it, so a clean clone needs no firmware checkout and no
+build toolchain — just `./init.sh && ./halo-emu --fetch latest`.
+`tools/fetch_firmware.py --list` shows what is published. Releases ship `<tag>.bin`
+(release build, the default pick) and `<tag>-debug.bin`; pre-release tags ship
+`halo-firmware-<ver>-{release,debug}.signed.bin` plus a bootloader that is never picked
+automatically. Only the debug build prints the boot banner — `main()` guards that
+`printk` with `CONFIG_HALO_LOG_LEVEL_DBG`.
+
+Before starting the machine, `halo-emu` checks the image against the ROM symbol map the
+synthetic stub implements (`tools/rom_map_check.py`, v1_2): every ROM call is a 32-bit
+address literal, so a release built for a different on-chip ROM image is visible
+statically and is refused with one clear message rather than crashing inside the stub.
+`--no-rom-map-check` overrides; images that make no ROM calls (the bare-metal test
+firmwares) pass untouched.
+
+`tests/smoke_boot.py` is the headless gate: banner (when the build has one), power
+manager → BLE manager → Lua runtime → `MCUboot image confirmed` (main()'s last statement),
+no fault/assert markers, exactly one boot, and no `qemu-system-arm` left behind after
+SIGTERM (ticket 0036's reaping). `.github/workflows/ci.yml` runs, on every push and
+nightly: the cached QEMU fork build, the ROM-map check, the boot smoke on both release
+assets, `tools/repl_smoke.py`, and the M1 device-test subset against the suite cloned
+from the firmware repo at the same tag — nothing in CI depends on a local checkout.
 
 Since ticket 0028 the synthetic BLE ROM stub (`rom-stub/`, loaded automatically by
 `halo-emu`) unblocks `main()` and can expose the raw GATT **doorbell bridge** on

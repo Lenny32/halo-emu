@@ -4,6 +4,7 @@
 
 Usage:
     halo-emu -f <firmware.bin|zephyr.signed.bin>
+    halo-emu --fetch <version|latest> [--fetch-debug]
              [--flash <mram.img>] [--flash-erase]
              [--headless] [--gdb]
              [--repl-port 9563] [--ble-port <raw port>]
@@ -120,6 +121,27 @@ The 256x256 panel (CDC200) shows up as the QEMU SDL window; --headless
 QMP screendump into the given file (.png, or raw PPM for any other
 extension), and shuts the emulator down — the CI path.
 
+--fetch <version> (ticket 0034) replaces -f with "download a firmware
+and use it": it pulls the release's application image from
+github.com/brilliantlabsAR/halo-firmware into firmwares/<tag>/ (cached,
+gitignored; $HALO_EMU_CACHE relocates it) and boots that.  <version> is
+a release tag (0.8.8, v0.8.9-3) or `latest`.  Releases publish
+`<tag>.bin` (release build, the default) and `<tag>-debug.bin`
+(--fetch-debug — the only build that prints the boot banner, which sits
+behind CONFIG_HALO_LOG_LEVEL_DBG); pre-release tags publish
+`halo-firmware-<ver>-{release,debug}.signed.bin` plus a bootloader that
+is never picked automatically.  --fetch-asset takes an exact name,
+--fetch-repo another repository.  `tools/fetch_firmware.py --list`
+shows what is published.
+
+Before the machine starts, the image is checked against the ROM symbol
+map the synthetic ROM stub implements (v1_2): a release built for a
+different on-chip ROM image would call ROM addresses that no longer mean
+what the stub thinks, so halo-emu refuses it with one clear message
+instead of crashing somewhere inside the stub.  Images that make no ROM
+calls at all (the bare-metal test firmwares) pass.  --no-rom-map-check
+skips it; `tools/rom_map_check.py -f <bin>` runs it on its own.
+
 The device's 2 MiB MRAM (0x80000000) is backed by a host file
 (default ./mram.img, created blank on first use) mapped MAP_SHARED into
 the machine, so /lfs — installed main.lua, settings, logs — survives
@@ -222,8 +244,29 @@ def parse_args():
         prog="halo-emu",
         description="Run a Halo firmware image on the QEMU halo machine "
                     "with persistent MRAM.")
-    p.add_argument("-f", "--firmware", required=True, metavar="BIN",
+    p.add_argument("-f", "--firmware", metavar="BIN",
                    help="firmware image (zephyr.bin or zephyr.signed.bin)")
+    p.add_argument("--fetch", metavar="VERSION",
+                   help="download a released firmware and run it: a "
+                        "release tag (0.8.8, v0.8.9-3) or 'latest', "
+                        "cached under firmwares/<tag>/. Mutually "
+                        "exclusive with -f")
+    p.add_argument("--fetch-debug", action="store_true",
+                   help="--fetch takes the -debug build instead of the "
+                        "release build (the debug build is the one that "
+                        "prints the boot banner)")
+    p.add_argument("--fetch-asset", metavar="NAME",
+                   help="exact release asset name for --fetch, bypassing "
+                        "the selection rule")
+    p.add_argument("--fetch-repo", metavar="OWNER/NAME",
+                   help="firmware repository for --fetch (default "
+                        "brilliantlabsAR/halo-firmware, or $HALO_FW_REPO)")
+    p.add_argument("--fetch-refresh", action="store_true",
+                   help="re-download even when the cached copy looks good")
+    p.add_argument("--no-rom-map-check", dest="rom_map_check",
+                   action="store_false",
+                   help="boot even if the firmware links against a ROM "
+                        "symbol map the ROM stub does not implement")
     p.add_argument("--flash", default="./mram.img", metavar="IMG",
                    help="MRAM backing file (default ./mram.img, "
                         "created blank)")
@@ -296,7 +339,44 @@ def parse_args():
                    help="chain-boot spike: load this mcuboot at MRAM 0 "
                         "and vector from 0x80000000")
     args = p.parse_args(argv)
+    if bool(args.firmware) == bool(args.fetch):
+        p.error("give exactly one of -f/--firmware and --fetch")
     return args, extra
+
+
+def resolve_firmware(args):
+    """--fetch: download (or reuse) the release image and point -f at
+    it, so everything downstream sees an ordinary local file."""
+    if not args.fetch:
+        return
+    sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
+    import fetch_firmware
+    try:
+        args.firmware = fetch_firmware.fetch(
+            args.fetch, repo=args.fetch_repo,
+            want_debug=args.fetch_debug, asset_name=args.fetch_asset,
+            refresh=args.fetch_refresh)
+    except fetch_firmware.FetchError as e:
+        die(f"--fetch {args.fetch}: {e}")
+
+
+def check_rom_map(args):
+    """Refuse a firmware built against a different on-chip ROM image
+    version (ticket 0034): the stub's pinned addresses would be wrong,
+    and the resulting crash says nothing useful."""
+    if not args.rom_map_check or args.rom_stub == "none":
+        return
+    sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
+    import rom_map_check
+    try:
+        image = open(args.firmware, "rb").read()
+    except OSError as e:
+        die(f"cannot read firmware: {e}")
+    verdict, msg, _, _ = rom_map_check.check(image)
+    if verdict == "mismatch":
+        die(msg)
+    if verdict == "ok":
+        print(f"halo-emu: {msg}", file=sys.stderr)
 
 
 def prepare_mram(args):
@@ -969,6 +1049,8 @@ def main():
         die(f"QEMU binary not found/executable: {QEMU} "
             "(build the fork first — see README.md)")
 
+    resolve_firmware(args)
+    check_rom_map(args)
     app_vtor = prepare_mram(args)
 
     svtor = MCUBOOT_VTOR if args.mcuboot else app_vtor
