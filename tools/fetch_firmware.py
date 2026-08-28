@@ -53,6 +53,11 @@ API = "https://api.github.com"
 # Assets that are never the application image.
 NOT_APP = ("bootloader", "mcuboot")
 
+# Firmware release the smoke tests' expectations are calibrated against
+# (sensor readings, camera frames, LE-audio handles); bump it only with
+# the assertions that go with it.
+CALIBRATION_VERSION = "0.8.8"
+
 
 class FetchError(Exception):
     """Anything that stops us handing back a firmware path."""
@@ -61,6 +66,20 @@ class FetchError(Exception):
 def cache_root():
     return os.environ.get("HALO_EMU_CACHE") or os.path.join(REPO_ROOT,
                                                             "firmwares")
+
+
+def default_firmware(version=CALIBRATION_VERSION, want_debug=False):
+    """The smoke tests' default `-f`, resolved without touching the network.
+
+    A checkout ships no firmware binary — `tools/fetch_firmware.py 0.8.8`
+    (or `halo-emu --fetch`) puts one in the cache, so look there first and
+    fall back to a hand-placed copy at the repo root.  The path is returned
+    even when neither exists: the caller's own "firmware not found" message
+    is the better place to say so.
+    """
+    name = f"{version}-debug.bin" if want_debug else f"{version}.bin"
+    cached = os.path.join(cache_root(), version, name)
+    return cached if os.path.exists(cached) else os.path.join(REPO_ROOT, name)
 
 
 def _repo(explicit=None):

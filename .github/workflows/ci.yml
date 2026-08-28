@@ -1,0 +1,169 @@
+# CI for the Halo desktop emulator (ticket 0034).
+#
+# The emulator is a fixture: it has to stay green against *released*
+# firmware, so CI fetches the release artifact from
+# github.com/brilliantlabsAR/halo-firmware and boots that.  Nothing here
+# depends on a firmware checkout being present on the machine — the
+# device test-suite is cloned from the same public repo, at the same tag
+# as the firmware under test.
+name: emulator
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly, so a new firmware release (or a ROM-map bump) shows up as
+    # a red build rather than as a surprise the next time someone runs it.
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      firmware_version:
+        description: 'Firmware release tag to test (or "latest")'
+        default: latest
+        type: string
+      device_tests:
+        description: 'Run the M1 device-test subset'
+        default: true
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FW_VERSION: ${{ inputs.firmware_version || 'latest' }}
+  # fetch_firmware.py and the firmware-repo clone both talk to the GitHub
+  # API; the token only lifts the anonymous rate limit.
+  GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  emulator:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # --- build the QEMU fork ------------------------------------------
+      #
+      # init.sh is idempotent: with both caches warm it re-applies the
+      # patches, runs an incremental ninja and rebuilds the ROM stub.
+      # deps/ (ARM toolchain + liblc3) only changes when init.sh does;
+      # qemu/ is keyed on the patch set, with a restore-key so a patch
+      # edit still starts from the previous build tree.
+      - name: Cache deps/ (ARM toolchain, liblc3, pixman)
+        uses: actions/cache@v6
+        with:
+          path: deps
+          key: deps-${{ runner.os }}-${{ hashFiles('init.sh') }}
+
+      - name: Cache qemu/ (checkout + build tree)
+        uses: actions/cache@v6
+        with:
+          path: qemu
+          key: qemu-${{ runner.os }}-${{ hashFiles('init.sh', 'patches/**') }}
+          restore-keys: |
+            qemu-${{ runner.os }}-
+
+      - name: Host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config build-essential \
+                                  libglib2.0-dev libpixman-1-dev libsdl2-dev
+
+      - name: Build QEMU fork + ROM stub
+        run: ./init.sh
+
+      - name: Versions
+        run: |
+          qemu/build/qemu-system-arm --version | head -1
+          ls -l rom-stub/build/rom-stub-v1_2.bin
+
+      # --- firmware under test ------------------------------------------
+      #
+      # Both assets of the release: the release build is what ships, the
+      # debug build is the only one that prints the boot banner (main()
+      # guards the printk with CONFIG_HALO_LOG_LEVEL_DBG).
+      - name: Fetch firmware release
+        id: fw
+        run: |
+          set -euo pipefail
+          release=$(tools/fetch_firmware.py "$FW_VERSION")
+          debug=$(tools/fetch_firmware.py "$FW_VERSION" --debug)
+          tag=$(basename "$(dirname "$release")")
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "debug=$debug"     >> "$GITHUB_OUTPUT"
+          echo "tag=$tag"         >> "$GITHUB_OUTPUT"
+          # A release without a -debug asset has no banner to assert; say
+          # so rather than failing the banner check for the wrong reason.
+          if [ "$debug" = "$release" ]; then
+            echo "has_debug=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=No debug asset::$tag ships no -debug build; the boot-banner check is skipped"
+          else
+            echo "has_debug=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "::notice title=Firmware under test::$tag ($(basename "$release"))"
+
+      # The synthetic ROM stub is pinned to ROM symbol map v1_2.  If a
+      # release moves to a different on-chip ROM image, say so here — in
+      # one legible step — instead of letting it surface as a crash
+      # inside the stub three steps later.
+      - name: Check ROM symbol map (stub is pinned to v1_2)
+        run: |
+          tools/rom_map_check.py -f "${{ steps.fw.outputs.release }}" --require-rom
+          tools/rom_map_check.py -f "${{ steps.fw.outputs.debug }}"   --require-rom
+
+      # --- smoke --------------------------------------------------------
+      #
+      # The release build goes through halo-emu's own --fetch, so the
+      # ticket's "download a firmware and use it" path is what CI runs,
+      # not just a local file it happens to have.
+      - name: Boot smoke (release build, via --fetch)
+        run: tests/smoke_boot.py --fetch "$FW_VERSION"
+
+      - name: Boot smoke (debug build, boot banner asserted)
+        if: steps.fw.outputs.has_debug == 'true'
+        run: tests/smoke_boot.py -f "${{ steps.fw.outputs.debug }}" --banner yes
+
+      - name: Lua REPL smoke
+        run: tools/repl_smoke.py -f "${{ steps.fw.outputs.release }}"
+
+      # --- device tests -------------------------------------------------
+      #
+      # The unmodified device suite from the firmware repo, at the tag of
+      # the firmware under test, driven through the emulator's
+      # brilliant_ble shim.  Cloned, never assumed to be on the machine.
+      - name: Clone the device test-suite at the firmware tag
+        if: inputs.device_tests != false
+        run: |
+          git clone --depth 1 --branch "${{ steps.fw.outputs.tag }}" \
+              https://github.com/brilliantlabsAR/halo-firmware.git \
+              "$RUNNER_TEMP/halo-firmware"
+
+      - uses: astral-sh/setup-uv@v10
+        if: inputs.device_tests != false
+
+      - name: Device tests (M1 subset)
+        if: inputs.device_tests != false
+        run: |
+          tools/run_emu_tests.py -f "${{ steps.fw.outputs.release }}" \
+              --tests-dir "$RUNNER_TEMP/halo-firmware/applications/halo/tests"
+
+      # --- teardown -----------------------------------------------------
+      #
+      # halo-emu reaps QEMU on SIGTERM/SIGHUP (ticket 0036).  A
+      # regression of that leaks an emulator that competes for CPU with
+      # the next test — the suspected cause of a one-off smoke_audio
+      # amplitude failure.  Catch it here, not as a mystery flake.
+      - name: No stray emulator processes
+        if: always()
+        run: |
+          # The bracket stops the pattern from matching a shell whose own
+          # command line quotes it; nothing else in this step spells the
+          # process name out, for the same reason.
+          if pgrep -a -f "[q]emu-system-arm"; then
+            echo "::error title=Leaked emulator::the emulator survived the test run — halo-emu's SIGTERM reaping (ticket 0036) regressed"
+            exit 1
+          fi
+          echo "no leaked emulator processes"

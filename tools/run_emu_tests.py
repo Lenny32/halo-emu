@@ -33,6 +33,8 @@ import sys
 import tempfile
 import time
 
+from fetch_firmware import CALIBRATION_VERSION, default_firmware
+
 # The tests are uv scripts with their own dependency headers (luaparser,
 # ...). Run them through uv when it exists so those resolve; PYTHONPATH
 # entries precede the script env's site-packages, so the brilliant_ble
@@ -204,8 +206,9 @@ def run_test(tests_dir, name, port, ctl_port, timeout):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("-f", "--firmware",
-                   default=os.path.join(REPO, "0.8.8.bin"),
-                   help="firmware image (default: ./0.8.8.bin)")
+                   default=default_firmware(),
+                   help="firmware image (default: the cached "
+                        f"{CALIBRATION_VERSION} release)")
     p.add_argument("--tests-dir",
                    help="firmware checkout's applications/halo/tests "
                         "(default: $HALO_FW_WS/applications/halo/tests)")
@@ -231,7 +234,9 @@ def main():
         sys.exit("run_emu_tests: tests directory not found — pass "
                  "--tests-dir or set HALO_FW_WS")
     if not os.path.exists(args.firmware):
-        sys.exit(f"run_emu_tests: firmware not found: {args.firmware}")
+        sys.exit(f"run_emu_tests: firmware not found: {args.firmware}\n"
+                 f"               fetch one first: "
+                 f"tools/fetch_firmware.py {CALIBRATION_VERSION}")
 
     selection = (args.only.split(",") if args.only else M1_SUBSET)
     missing = [t for t in selection

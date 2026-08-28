@@ -46,6 +46,7 @@ HALO_EMU = os.path.join(REPO, "halo-emu")
 sys.path.insert(0, os.path.join(REPO, "tools"))
 sys.path.insert(0, os.path.join(REPO, "tests"))
 from repl_smoke import Repl  # noqa: E402
+from fetch_firmware import CALIBRATION_VERSION, default_firmware  # noqa: E402
 from smoke_controls import Ctl, pump_until  # noqa: E402
 
 ACCEL_LSB_PER_G = 16384
@@ -79,14 +80,16 @@ def lua_floats(r, expr, names):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("-f", "--firmware",
-                   default=os.path.join(REPO, "0.8.8.bin"))
+                   default=default_firmware())
     p.add_argument("--repl-port", type=int, default=9563)
     p.add_argument("--ctl-port", type=int, default=9562)
     p.add_argument("--boot-wait", type=float, default=20.0)
     args = p.parse_args()
 
     if not os.path.exists(args.firmware):
-        sys.exit(f"smoke_sensors: firmware not found: {args.firmware}")
+        sys.exit(f"smoke_sensors: firmware not found: {args.firmware}\n"
+                 f"               fetch one first: "
+                 f"tools/fetch_firmware.py {CALIBRATION_VERSION}")
 
     flash = tempfile.mktemp(prefix="halo-sensors-smoke-", suffix=".img")
     proc = subprocess.Popen(

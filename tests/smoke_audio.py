@@ -43,6 +43,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HALO_EMU = os.path.join(REPO, "halo-emu")
 sys.path.insert(0, os.path.join(REPO, "tools"))
 from repl_smoke import Repl  # noqa: E402
+from fetch_firmware import CALIBRATION_VERSION, default_firmware  # noqa: E402
 sys.path.insert(0, os.path.join(REPO, "tests"))
 from smoke_controls import Ctl  # noqa: E402
 
@@ -131,7 +132,7 @@ def summarise(r, expr, timeout=15):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("-f", "--firmware",
-                   default=os.path.join(REPO, "0.8.8.bin"))
+                   default=default_firmware())
     p.add_argument("--repl-port", type=int, default=9563)
     p.add_argument("--ctl-port", type=int, default=9562)
     p.add_argument("--boot-wait", type=float, default=25.0)
@@ -140,7 +141,9 @@ def main():
     args = p.parse_args()
 
     if not os.path.exists(args.firmware):
-        sys.exit(f"smoke_audio: firmware not found: {args.firmware}")
+        sys.exit(f"smoke_audio: firmware not found: {args.firmware}\n"
+                 f"             fetch one first: "
+                 f"tools/fetch_firmware.py {CALIBRATION_VERSION}")
 
     workdir = args.keep_wav or tempfile.mkdtemp(prefix="halo-audio-smoke-")
     os.makedirs(workdir, exist_ok=True)

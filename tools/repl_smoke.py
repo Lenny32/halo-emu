@@ -31,6 +31,8 @@ import sys
 import tempfile
 import time
 
+from fetch_firmware import CALIBRATION_VERSION, default_firmware
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HALO_EMU = os.path.join(REPO, "halo-emu")
 
@@ -126,8 +128,9 @@ def wait_for_repl(port, timeout, proc=None):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("-f", "--firmware",
-                   default=os.path.join(REPO, "0.8.8.bin"),
-                   help="firmware image (default: ./0.8.8.bin)")
+                   default=default_firmware(),
+                   help="firmware image (default: the cached "
+                        f"{CALIBRATION_VERSION} release)")
     p.add_argument("--port", type=int, default=9563)
     p.add_argument("--boot-wait", type=float, default=120.0,
                    help="seconds to wait for the Lua runtime to answer "
@@ -136,7 +139,9 @@ def main():
     args = p.parse_args()
 
     if not os.path.exists(args.firmware):
-        sys.exit(f"repl_smoke: firmware not found: {args.firmware}")
+        sys.exit(f"repl_smoke: firmware not found: {args.firmware}\n"
+                 f"            fetch one first: "
+                 f"tools/fetch_firmware.py {CALIBRATION_VERSION}")
 
     flash = tempfile.mktemp(prefix="halo-repl-smoke-", suffix=".img")
     proc = subprocess.Popen(

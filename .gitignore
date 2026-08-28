@@ -7,6 +7,9 @@ build/
 # persistent MRAM images and cached firmware binaries — runtime artifacts
 *.img
 firmwares/
+# a hand-placed firmware image at the repo root (tools/fetch_firmware.py is
+# the supported way to get one; the tests fall back to this path)
+/*.bin
 deps/
 __pycache__/
 *.pyc
