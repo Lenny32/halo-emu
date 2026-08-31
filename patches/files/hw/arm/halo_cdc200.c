@@ -33,6 +33,12 @@
  *    either — CFB_LENGTH holds the line pitch in [31:16], CFB_LINES
  *    the line count.
  *
+ * The panel is portrait-mounted on the device, so the scanout is
+ * presented rotated 90° counter-clockwise: framebuffer pixel (x, y)
+ * lands at screen (y, panel_w - 1 - x).  The firmware renders for the
+ * mounted orientation (glyphs are rotated in the framebuffer); without
+ * this the window and screendumps show everything sideways.
+ *
  * The frame tick is a 30 Hz virtual-clock timer, comfortably inside
  * the ticket's 30-60 Hz budget for the 8.76 MHz / 256x256 panel, and
  * independent of the UI backend so `-display none` still delivers the
@@ -197,10 +203,9 @@ static void halo_cdc_draw_layer(HaloCdcState *s, DisplaySurface *surface,
     lh = MIN(lh, (int)lines);
     lh = MIN(lh, ph - y0);
 
+    /* Portrait mount: fb (x, y) -> screen (y, pw-1-x), so one fb line
+     * lands in one screen column. */
     for (int y = 0; y < lh; y++) {
-        uint32_t *dst = (uint32_t *)(surface_data(surface) +
-                                     (y0 + y) * surface_stride(surface)) + x0;
-
         if (address_space_read(&address_space_memory,
                                addr + (hwaddr)y * pitch,
                                MEMTXATTRS_UNSPECIFIED,
@@ -208,7 +213,11 @@ static void halo_cdc_draw_layer(HaloCdcState *s, DisplaySurface *surface,
             return;
         }
         for (int x = 0; x < lw; x++) {
-            dst[x] = halo_cdc_pixel(linebuf + (size_t)x * bpp, fmt);
+            uint32_t *dst = (uint32_t *)(surface_data(surface) +
+                                         (pw - 1 - (x0 + x)) *
+                                         surface_stride(surface));
+
+            dst[y0 + y] = halo_cdc_pixel(linebuf + (size_t)x * bpp, fmt);
         }
     }
 }
@@ -217,22 +226,25 @@ static bool halo_cdc_gfx_update(void *opaque)
 {
     HaloCdcState *s = opaque;
     DisplaySurface *surface;
-    int pw, ph;
+    int pw, ph, sw, sh;
 
     halo_cdc_panel_size(s, &pw, &ph);
-    if (qemu_console_get_width(s->console, 0) != pw ||
-        qemu_console_get_height(s->console, 0) != ph) {
-        qemu_console_resize(s->console, pw, ph);
+    /* Portrait mount: the screen is the framebuffer rotated 90° CCW */
+    sw = ph;
+    sh = pw;
+    if (qemu_console_get_width(s->console, 0) != sw ||
+        qemu_console_get_height(s->console, 0) != sh) {
+        qemu_console_resize(s->console, sw, sh);
     }
     surface = qemu_console_surface(s->console);
 
     if (halo_cdc_enabled(s)) {
         uint32_t bg = 0xff000000u | (s->reg[0x2C / 4] & 0xffffff);
 
-        for (int y = 0; y < ph; y++) {
+        for (int y = 0; y < sh; y++) {
             uint32_t *dst = (uint32_t *)(surface_data(surface) +
                                          y * surface_stride(surface));
-            for (int x = 0; x < pw; x++) {
+            for (int x = 0; x < sw; x++) {
                 dst[x] = bg;
             }
         }
@@ -241,13 +253,13 @@ static bool halo_cdc_gfx_update(void *opaque)
         }
     } else {
         /* Disabled = blanked panel */
-        for (int y = 0; y < ph; y++) {
+        for (int y = 0; y < sh; y++) {
             memset(surface_data(surface) + y * surface_stride(surface), 0,
-                   (size_t)pw * 4);
+                   (size_t)sw * 4);
         }
     }
 
-    qemu_console_update(s->console, 0, 0, pw, ph);
+    qemu_console_update(s->console, 0, 0, sw, sh);
     return true;
 }
 

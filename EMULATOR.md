@@ -218,7 +218,10 @@ RGB888 256×256, framebuffer fixed at bus `0x58930000` (= CPU `0x20130000`, `fb0
 `.alif_ns`), pitch 768. Enable = `GLB_CTRL@0x18` bit0; commit = `SRCTRL@0x24` shadow
 reload. Panel vga020 (DSI, I2C ctrl @ i2c1 addr `0x54`, lazy-init) + TPS65132 PMIC (`0x3E`);
 DSI `0x49032000` / D-PHY `0x4903F000` need only `PHY_LOCK`/stop-state fakes (bounded
-timeouts; failure skips the splash, non-fatal).
+timeouts; failure skips the splash, non-fatal). The panel is portrait-mounted: the
+firmware renders rotated into the framebuffer, so the model presents the scanout
+rotated 90° CCW (fb `(x, y)` → screen `(y, 255−x)`) — the UI window, screendumps,
+and the A/V bridge all show the mounted (upright) orientation.
 
 ## Other peripherals (lazy-init, non-fatal)
 

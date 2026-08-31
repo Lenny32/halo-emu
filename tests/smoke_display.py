@@ -130,9 +130,12 @@ def wait_marker(proc, deadline_markers, timeout=30.0):
 def check_bars(w, h, pixels):
     if (w, h) != (256, 256):
         fail(f"panel is {w}x{h}, expected 256x256")
+    # The panel is portrait-mounted: scanout presents the framebuffer
+    # rotated 90 deg CCW, fb (x, y) -> screen (y, 255 - x), so the fb's
+    # vertical bars appear as horizontal bands, bar 0 at the bottom.
     for i, want in enumerate(BARS):
-        for x, y in ((i * 32 + 16, 32), (i * 32 + 16, 128),
-                     (i * 32 + 16, 224)):
+        for x, y in ((32, 239 - i * 32), (128, 239 - i * 32),
+                     (224, 239 - i * 32)):
             got = pixel(pixels, w, x, y)
             if got != want:
                 fail(f"bar {i} at ({x},{y}): got {got}, want {want}")
