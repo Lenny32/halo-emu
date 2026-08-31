@@ -13,3 +13,6 @@ firmwares/
 deps/
 __pycache__/
 *.pyc
+
+# av_bridge runtime state (self-signed TLS cert) — ticket 0040
+.avbridge/

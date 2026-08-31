@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Halo phone sensors</title>
+<link rel="stylesheet" href="/webui/style.css">
+</head>
+<body class="phone">
+<h1>Halo emulator — phone sensors</h1>
+<p id="status" class="badge">idle</p>
+
+<video id="preview" autoplay muted playsinline></video>
+<div id="meter"><div></div></div>
+
+<div class="row" style="margin-top:12px">
+  <label>Camera device
+    <select id="cam-dev"><option value="">(default)</option></select>
+  </label>
+</div>
+<div class="row">
+  <label>Microphone
+    <select id="mic-dev"><option value="">(default)</option></select>
+  </label>
+</div>
+<div class="row">
+  <label>Output / headphones
+    <select id="out-dev"><option value="">(default)</option></select>
+  </label>
+  <button id="listen">🔊 Listen to emulator</button>
+  <span id="listen-state" class="badge">off</span>
+</div>
+
+<div class="row">
+  <label>Resolution
+    <select id="res">
+      <option value="320x240" selected>320×240</option>
+      <option value="640x480">640×480</option>
+    </select>
+  </label>
+  <label>fps
+    <select id="fps">
+      <option>2</option>
+      <option selected>5</option>
+      <option>10</option>
+    </select>
+  </label>
+</div>
+
+<button id="start" class="primary bigbtn">Start streaming</button>
+<div id="stats"></div>
+
+<script src="/webui/phone.js"></script>
+</body>
+</html>

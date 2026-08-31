@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Halo emulator bridge</title>
+<link rel="stylesheet" href="/webui/style.css">
+</head>
+<body>
+<h1>Halo emulator — A/V bridge</h1>
+
+<div class="grid">
+  <div class="col">
+    <div class="panel">
+      <h2>Display</h2>
+      <canvas id="screen" width="256" height="256"></canvas>
+      <div class="row" style="margin-top:8px">
+        <button id="btn-click">Button click</button>
+        <button id="btn-hold">Hold 1 s</button>
+        <button id="btn-down">Down</button>
+        <button id="btn-up">Up</button>
+      </div>
+      <div class="row">
+        <button id="spk-enable">🔊 Enable speaker</button>
+        <span id="spk-state" class="badge">speaker off</span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Phone</h2>
+      <div class="row">
+        <img id="qr" src="/qr.svg" alt="phone page QR">
+        <div style="flex:1; min-width:180px">
+          <div id="phone-state" class="badge">no phone</div>
+          <p class="url" id="phone-url"></p>
+          <div class="row">
+            <label>camera push fps
+              <select id="cam-fps">
+                <option>1</option><option>2</option>
+                <option selected>5</option><option>10</option>
+              </select>
+            </label>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="col">
+    <div class="panel">
+      <h2>Status</h2>
+      <div class="kv" id="status-kv"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Controls</h2>
+      <div class="row">
+        <span>Battery</span>
+        <input type="range" id="batt" min="0" max="100" value="80">
+        <span id="batt-lbl">80%</span>
+      </div>
+      <div class="row">
+        <label><input type="checkbox" id="charger"> Charger connected</label>
+      </div>
+      <div class="row">
+        <span>Tap</span>
+        <button data-ctl="tap single">single</button>
+        <button data-ctl="tap double">double</button>
+        <button data-ctl="tap triple">triple</button>
+      </div>
+      <div class="row">
+        <span>Accel (mg)</span>
+        <input type="number" id="ax" value="1000">
+        <input type="number" id="ay" value="0">
+        <input type="number" id="az" value="0">
+        <button id="accel-set">Set</button>
+      </div>
+      <div class="row">
+        <button data-ctl="reboot" class="danger">Reboot</button>
+        <button data-ctl="wdt-fire" class="danger">Watchdog</button>
+        <button id="shutdown" class="danger">Shutdown</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Control socket</h2>
+      <div class="row">
+        <input type="text" id="ctl-line" style="flex:1"
+               placeholder="e.g. mic tone 1000, camera test-pattern, led?">
+        <button id="ctl-send">Send</button>
+      </div>
+      <div id="log"></div>
+    </div>
+  </div>
+</div>
+
+<script src="/webui/app.js"></script>
+</body>
+</html>

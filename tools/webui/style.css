@@ -1,0 +1,122 @@
+/* av_bridge web UI (ticket 0040) — shared by index.html and phone.html */
+
+:root {
+  --bg: #14161a;
+  --panel: #1e2128;
+  --edge: #2e323c;
+  --fg: #d8dce4;
+  --dim: #8b93a3;
+  --accent: #4da3ff;
+  --ok: #4fc46a;
+  --bad: #e05555;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 16px;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.45 system-ui, sans-serif;
+}
+
+h1 { font-size: 18px; margin: 0 0 12px; }
+h2 { font-size: 13px; margin: 0 0 8px; color: var(--dim);
+     text-transform: uppercase; letter-spacing: .06em; }
+
+.grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 16px;
+  align-items: start;
+}
+
+.col { display: flex; flex-direction: column; gap: 16px; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+#screen {
+  width: 512px;
+  height: 512px;
+  image-rendering: pixelated;
+  background: #000;
+  border-radius: 4px;
+  display: block;
+}
+
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+       margin-bottom: 8px; }
+.row:last-child { margin-bottom: 0; }
+
+button {
+  background: #2a2e37;
+  color: var(--fg);
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font: inherit;
+}
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); color: #08121f;
+                 border-color: var(--accent); font-weight: 600; }
+button.danger:hover { border-color: var(--bad); }
+
+input[type="text"], input[type="number"], select {
+  background: #12141a;
+  color: var(--fg);
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font: inherit;
+}
+input[type="number"] { width: 72px; }
+input[type="range"] { flex: 1; }
+
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; }
+.kv .k { color: var(--dim); }
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 99px;
+  font-size: 12px;
+  background: #2a2e37;
+  color: var(--dim);
+}
+.badge.on { background: rgba(79, 196, 106, .15); color: var(--ok); }
+
+#log {
+  height: 140px;
+  overflow-y: auto;
+  background: #12141a;
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font: 12px/1.5 ui-monospace, monospace;
+  white-space: pre-wrap;
+}
+
+#qr { width: 160px; height: 160px; background: #fff; border-radius: 6px;
+      padding: 6px; }
+.url { font: 12px ui-monospace, monospace; color: var(--accent);
+       word-break: break-all; }
+
+/* phone page */
+.phone body, body.phone { padding: 12px; }
+#preview { width: 100%; max-width: 480px; border-radius: 8px;
+           background: #000; display: block; }
+#meter { height: 10px; background: #12141a; border-radius: 5px;
+         overflow: hidden; margin-top: 8px; max-width: 480px; }
+#meter > div { height: 100%; width: 0; background: var(--ok);
+               transition: width 60ms linear; }
+.bigbtn { width: 100%; max-width: 480px; padding: 14px; font-size: 17px;
+          margin-top: 12px; }
+#stats { color: var(--dim); font: 12px ui-monospace, monospace;
+         margin-top: 8px; }
