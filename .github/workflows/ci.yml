@@ -141,7 +141,7 @@ jobs:
               https://github.com/brilliantlabsAR/halo-firmware.git \
               "$RUNNER_TEMP/halo-firmware"
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.0.1
         if: inputs.device_tests != false
 
       - name: Device tests (M1 subset)
